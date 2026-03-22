@@ -385,18 +385,28 @@ class ChatMonitor:
         # Track URL changes (user switched chats)
         if url != self._active_chat_url:
             self._active_chat_url = url
-            # Seed new chat if unknown
+            # Seed new chat if unknown — with tail backfill
             if url not in self._chat_states:
                 try:
                     count = await page.evaluate(
                         "() => document.querySelectorAll('[data-message-author-role]').length"
                     )
-                    self._chat_states[url] = ChatState(
+                    state = ChatState(
                         url=url, last_seen_count=count,
                         last_checked_at=time.time(),
                     )
-                except Exception:
-                    pass
+                    self._chat_states[url] = state
+                    # Backfill tail for triggers
+                    tail_size = getattr(config, 'MONITOR_TAIL_SIZE', 5)
+                    async with self._browser._page_lock:
+                        tail_start = max(0, count - tail_size)
+                        messages = await self._read_messages_from_page(
+                            page, tail_start, count
+                        )
+                    self._check_triggers(messages, url, state)
+                    self._save_chat_states()
+                except Exception as e:
+                    log.warning("Monitor: failed to seed switched chat: %s", e)
                 return
 
         # Fast count check (no lock)
@@ -409,10 +419,23 @@ class ChatMonitor:
 
         state = self._chat_states.get(url)
         if not state:
-            self._chat_states[url] = ChatState(
+            state = ChatState(
                 url=url, last_seen_count=count,
                 last_checked_at=time.time(),
             )
+            self._chat_states[url] = state
+            # Backfill tail for triggers on first encounter
+            tail_size = getattr(config, 'MONITOR_TAIL_SIZE', 5)
+            try:
+                async with self._browser._page_lock:
+                    tail_start = max(0, count - tail_size)
+                    messages = await self._read_messages_from_page(
+                        page, tail_start, count
+                    )
+                self._check_triggers(messages, url, state)
+                self._save_chat_states()
+            except Exception as e:
+                log.warning("Monitor: failed to backfill first-encounter: %s", e)
             return
 
         if count <= state.last_seen_count:
