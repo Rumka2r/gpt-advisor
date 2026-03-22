@@ -289,12 +289,25 @@ class ChatMonitor:
             else:
                 log.info("Seed: %s — no missed messages (%d)", url[-30:], count)
         else:
-            # First time ever — seed from scratch
+            # First time ever — seed from scratch but check tail for triggers
             state = ChatState(url=url, last_seen_count=count,
                               last_checked_at=time.time())
             self._chat_states[url] = state
             self._active_chat_url = url
-            log.info("Seeded active chat (fresh): %s (%d msgs)", url[-30:], count)
+            log.info("Seeded active chat (fresh): %s (%d msgs). Checking tail...",
+                     url[-30:], count)
+            # Backfill: check tail for existing triggers
+            tail_size = getattr(config, 'MONITOR_TAIL_SIZE', 5)
+            try:
+                async with self._browser._page_lock:
+                    tail_start = max(0, count - tail_size)
+                    messages = await self._read_messages_from_page(
+                        page, tail_start, count
+                    )
+                self._check_triggers(messages, url, state)
+                self._save_chat_states()
+            except Exception as e:
+                log.warning("Failed to backfill tail triggers: %s", e)
 
     # ── Main loop ─────────────────────────────────────────────────
 
