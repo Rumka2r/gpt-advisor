@@ -172,8 +172,8 @@ class ChatMonitor:
                 "total_triggers": self._trigger_count}
 
     def get_status(self) -> dict:
-        """Get current monitor status."""
-        return {
+        """Get current monitor status (includes browser diagnostics)."""
+        status = {
             "running": self._running,
             "mode": self._mode,
             "started_at": self._started_at,
@@ -186,6 +186,12 @@ class ChatMonitor:
             "has_monitor_page": self._monitor_page is not None,
             "processed_dedup_keys": len(self._processed),
         }
+        # Include browser-level diagnostics
+        if self._browser:
+            status["last_error"] = self._browser._last_error
+            status["last_error_at"] = self._browser._last_error_at
+            status["last_sync_at"] = self._browser._last_sync_at
+        return status
 
     def get_events(self, clear: bool = True) -> list[dict]:
         """Get accumulated monitor events."""
