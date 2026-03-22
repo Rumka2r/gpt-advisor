@@ -220,7 +220,7 @@ class ChatMonitor:
     async def _monitor_loop(self):
         """Two-tier monitoring loop."""
         active_interval = getattr(config, 'MONITOR_ACTIVE_POLL_SEC', 3)
-        recent_interval = getattr(config, 'MONITOR_RECENT_POLL_SEC', 15)
+        recent_interval = getattr(config, 'MONITOR_RECENT_POLL_SEC', 8)
 
         ticks = 0
         recent_every = max(1, recent_interval // active_interval)
@@ -552,7 +552,7 @@ class ChatMonitor:
             if not text.strip():
                 continue
 
-            # Dedup key: url + index + text hash (first 200 chars)
+            # Dedup key: url + index + full text hash
             dedup_key = f"{chat_url}:{index}:{self._hash(text)}"
             if dedup_key in self._processed:
                 continue
@@ -606,7 +606,7 @@ class ChatMonitor:
             "message_index": msg.get("index", -1),
             "role": msg.get("role", "unknown"),
             "text_preview": msg.get("text", "")[:300],
-            "message_hash": self._hash(msg.get("text", "")[:200]),
+            "message_hash": self._hash(msg.get("text", "")),
             "timestamp": time.time(),
         }
 
