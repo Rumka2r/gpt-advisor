@@ -24,8 +24,8 @@ LONG_WAIT_THRESHOLD = 120_000   # notify after 2 min
 RESPONSE_STABLE_CYCLES = 2
 
 # Project
-PROJECT_NAME = "Агент"
-PROJECT_URL = "https://chatgpt.com/g/g-p-69be9784c38481918d9f2c78154806f8-agent/project"
+PROJECT_NAME = "бот"
+PROJECT_URL = "https://chatgpt.com/g/g-p-698fa0794eb881918de3651fc2a395a4/project"
 
 # Persistent chat — the ONE shared chat for user + architect + GPT
 # Updated by /chat/rotate endpoint
