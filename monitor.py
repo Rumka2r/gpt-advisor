@@ -91,6 +91,11 @@ class ChatMonitor:
         self._scan_count = 0
         self._trigger_count = 0
 
+        # Persistent chat states file
+        self._chat_states_file = os.path.join(
+            os.path.dirname(__file__), "monitor-chat-states.json"
+        )
+
     # ── Lifecycle ──────────────────────────────────────────────────
 
     async def start(self, mode: str = "project_recent") -> dict:
@@ -111,8 +116,9 @@ class ChatMonitor:
         self._scan_count = 0
         self._trigger_count = 0
 
-        # Load persistent dedup (don't clear — preserves across restarts)
+        # Load persistent state (dedup + chat states — preserves across restarts)
         self._load_dedup()
+        self._load_chat_states()
 
         # Track active chat
         self._active_chat_url = self._browser._page.url
@@ -165,6 +171,9 @@ class ChatMonitor:
                 pass
             self._monitor_page = None
 
+        # Persist state before stopping
+        self._save_chat_states()
+        self._save_dedup()
         log.info("Monitor stopped (scans=%d, triggers=%d)",
                  self._scan_count, self._trigger_count)
         return {"ok": True, "status": "stopped",
@@ -200,10 +209,47 @@ class ChatMonitor:
             self._events.clear()
         return events
 
+    # ── Persistent chat states ──────────────────────────────────────
+
+    def _load_chat_states(self):
+        """Load persisted chat states (last_seen_count per URL) from disk."""
+        try:
+            if os.path.exists(self._chat_states_file):
+                with open(self._chat_states_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for url, info in data.get("states", {}).items():
+                    self._chat_states[url] = ChatState(
+                        url=url,
+                        title=info.get("title", ""),
+                        project=info.get("project", ""),
+                        last_seen_count=info.get("last_seen_count", 0),
+                        last_checked_at=info.get("last_checked_at", 0),
+                    )
+                log.info("Loaded %d chat states from disk", len(self._chat_states))
+        except Exception as e:
+            log.warning("Failed to load chat states: %s", e)
+
+    def _save_chat_states(self):
+        """Save chat states to disk for persistence across restarts."""
+        try:
+            states = {}
+            for url, state in self._chat_states.items():
+                states[url] = {
+                    "title": state.title,
+                    "project": state.project,
+                    "last_seen_count": state.last_seen_count,
+                    "last_checked_at": state.last_checked_at,
+                }
+            with open(self._chat_states_file, "w", encoding="utf-8") as f:
+                json.dump({"states": states, "updated_at": time.time()}, f)
+        except Exception as e:
+            log.warning("Failed to save chat states: %s", e)
+
     # ── Seed state ─────────────────────────────────────────────────
 
     async def _seed_active_chat_state(self):
-        """Record current message count so we don't trigger on old messages."""
+        """Seed active chat state. Uses persisted state if available,
+        otherwise records current count. Checks tail for missed triggers."""
         page = self._browser._page
         url = page.url
         if "/c/" not in url:
@@ -213,13 +259,42 @@ class ChatMonitor:
             count = await page.evaluate(
                 "() => document.querySelectorAll('[data-message-author-role]').length"
             )
+        except Exception as e:
+            log.warning("Failed to seed active chat: %s", e)
+            return
+
+        # Check if we have persisted state for this chat
+        persisted = self._chat_states.get(url)
+        if persisted and persisted.last_seen_count > 0:
+            old_count = persisted.last_seen_count
+            persisted.last_checked_at = time.time()
+            self._active_chat_url = url
+
+            # Check messages that arrived during downtime
+            if count > old_count:
+                missed = count - old_count
+                log.info("Seed: %s had %d msgs, now %d (+%d missed). Checking triggers...",
+                         url[-30:], old_count, count, missed)
+                try:
+                    async with self._browser._page_lock:
+                        messages = await self._read_messages_from_page(
+                            page, old_count, count
+                        )
+                    self._check_triggers(messages, url, persisted)
+                    persisted.last_seen_count = count
+                    self._save_chat_states()
+                except Exception as e:
+                    log.warning("Failed to check missed messages: %s", e)
+                    persisted.last_seen_count = count
+            else:
+                log.info("Seed: %s — no missed messages (%d)", url[-30:], count)
+        else:
+            # First time ever — seed from scratch
             state = ChatState(url=url, last_seen_count=count,
                               last_checked_at=time.time())
             self._chat_states[url] = state
             self._active_chat_url = url
-            log.info("Seeded active chat state: %s (%d msgs)", url[-30:], count)
-        except Exception as e:
-            log.warning("Failed to seed active chat: %s", e)
+            log.info("Seeded active chat (fresh): %s (%d msgs)", url[-30:], count)
 
     # ── Main loop ─────────────────────────────────────────────────
 
@@ -353,6 +428,9 @@ class ChatMonitor:
         # Check triggers
         self._check_triggers(new_messages, url, state)
 
+        # Persist state after update
+        self._save_chat_states()
+
     # ── Tier 2: Recent chats ─────────────────────────────────────
 
     async def _scan_recent_chats(self):
@@ -476,6 +554,7 @@ class ChatMonitor:
                         # On first encounter, check tail for existing triggers
                         messages = await self._read_tail_from_page(page, tail_size)
                         self._check_triggers(messages, chat_url, state)
+                        self._save_chat_states()
                         continue
 
                     # Update title if needed
@@ -498,6 +577,7 @@ class ChatMonitor:
                             )
 
                         self._check_triggers(messages, chat_url, state)
+                        self._save_chat_states()
                     else:
                         state.last_checked_at = time.time()
 

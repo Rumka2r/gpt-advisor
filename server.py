@@ -658,6 +658,12 @@ async def on_startup():
                                       timeout=config.NAVIGATION_TIMEOUT)
         except Exception:
             log.warning("Initial navigation to ChatGPT timed out (may need login)")
+    # Auto-start monitor (immortal — always running)
+    try:
+        monitor_result = await browser.start_monitor(mode="project_recent")
+        log.info("Monitor auto-started: %s", monitor_result)
+    except Exception as e:
+        log.error("Monitor auto-start failed: %s", e)
     log.info("Server ready at http://%s:%d", config.HOST, config.PORT)
 
 
