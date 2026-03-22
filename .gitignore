@@ -1,0 +1,10 @@
+browser-data/
+__pycache__/
+*.pyc
+*.json
+!test-msg.json
+*.zip
+*.log
+*.jsonl
+temp_msg.txt
+active-chat-url.txt
