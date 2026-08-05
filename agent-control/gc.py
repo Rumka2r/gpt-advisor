@@ -978,18 +978,39 @@ def do_purge(con, uid, kind, qpath):
     return True, ""
 
 
+def in_scope(uid, path, kind, sel):
+    """Попадает ли ресурс под ограничения запуска.
+
+    🔴 Без этого «сначала только зоны» технически невозможно: один ручной
+    запуск ради двух пробных ресурсов перенёс бы и удалил всё созревшее.
+    """
+    if sel.get("only_uuid") and uid not in sel["only_uuid"]:
+        return False
+    scope = sel.get("scope", "all")
+    in_zone = path.startswith(AGENTS_DIR + os.sep)
+    if scope == "zones":
+        return in_zone and kind != "worktree"
+    if scope == "worktrees":
+        return kind == "worktree"
+    return True
+
+
 def recover(con, sel=None):
     """При точечном запуске разбирает ТОЛЬКО указанные ресурсы: иначе ручная
     команда ради одного canary-каталога чинила бы состояния всех остальных."""
     sel = sel or {}
     only = sel.get("only_uuid") or None
+    # 🔴 Область тоже обязательна: запуск таймера с областью zones не должен
+    # чинить состояния рабочих копий, которые в эту область не входят.
+    scope = sel.get("scope", "all")
     """Разобрать зависшие переходы после падения: файловая система и база могли
     разойтись ровно между фиксацией намерения и действием."""
     fixed = []
     for uid, path, kind, ip, qp in con.execute(
             "SELECT uuid, path, kind, intended_path, quarantine_path FROM resources "
             "WHERE state='QUARANTINING'").fetchall():
-        if only and uid not in only:
+        if not in_scope(uid, path, kind,
+                        {"only_uuid": only or set(), "scope": scope}):
             continue
         # 🔴 Недоступный карантин НЕ значит «перенесено и удалено». Пока корень
         # карантина не читается, решение не принимаем вообще.
@@ -1020,7 +1041,8 @@ def recover(con, sel=None):
     for uid, path, kind, qp in con.execute(
             "SELECT uuid, path, kind, quarantine_path FROM resources "
             "WHERE state='PURGEABLE'").fetchall():
-        if only and uid not in only:
+        if not in_scope(uid, path, kind,
+                        {"only_uuid": only or set(), "scope": scope}):
             continue
         qroot = os.path.dirname(qp) if qp else quarantine_root(path)
         if not os.path.isdir(qroot):
@@ -1034,23 +1056,6 @@ def recover(con, sel=None):
             to_state(con, uid, "DELETED", "восстановлено: удаление состоялось", live=0)
             fixed.append((uid, path, "удаление состоялось"))
     return fixed
-
-
-def in_scope(uid, path, kind, sel):
-    """Попадает ли ресурс под ограничения запуска.
-
-    🔴 Без этого «сначала только зоны» технически невозможно: один ручной
-    запуск ради двух пробных ресурсов перенёс бы и удалил всё созревшее.
-    """
-    if sel.get("only_uuid") and uid not in sel["only_uuid"]:
-        return False
-    scope = sel.get("scope", "all")
-    in_zone = path.startswith(AGENTS_DIR + os.sep)
-    if scope == "zones":
-        return in_zone and kind != "worktree"
-    if scope == "worktrees":
-        return kind == "worktree"
-    return True
 
 
 def advance(con, disk, apply_, scan_res, sel=None):
