@@ -373,8 +373,22 @@ def check(con, d):
     """«Можно ли мне сейчас это делать?» — спрашивать ПЕРЕД каждой опасной
     операцией, а не один раз в начале. Между началом задачи и деплоем аренда
     могла протухнуть."""
-    r, token, fencing = d["resource"], d.get("lease_token", ""), d.get("fencing_token")
+    r0, token, fencing = d["resource"], d.get("lease_token", ""), d.get("fencing_token")
+    r, err = canon(r0)
+    if err:
+        return {"allow": False, "причина": err}
     sweep(con)
+    # 🔴 Удержание, поставленное УЖЕ ПОСЛЕ выдачи аренды, обязано останавливать
+    # работу. Раньше здесь смотрели только на аренду и поколение: сборщик успевал
+    # взять захват, перечитать удержания (пусто), уйти в долгое спасение — и за
+    # это время поставленный hold не мешал ему ничего.
+    t = now()
+    for hres, hreason in con.execute(
+            "SELECT resource, reason FROM holds WHERE expires_at=0 OR expires_at>?",
+            (t,)):
+        if conflicts_with(r, hres):
+            return {"allow": False,
+                    "причина": f"ресурс закрыт удержанием {hres}: {hreason}"}
     row = con.execute("SELECT lease_token, fencing_token, agent_id, expires FROM leases "
                       "WHERE resource=?", (r,)).fetchone()
     if not row:
@@ -477,6 +491,21 @@ def hold_add(con, d):
     if not exp and not d.get("_admin"):
         return {"ok": False, "причина": "бессрочное удержание ставит только Мост; "
                                         "укажи expires_at"}
+    # 🔴 Удержание Моста агент не может ни снять, ни ПЕРЕЗАПИСАТЬ своим — иначе
+    # запрет обходится установкой собственного удержания с коротким сроком.
+    prev = con.execute("SELECT approved_by FROM holds WHERE resource=?", (r,)).fetchone()
+    if prev and prev[0] and not d.get("_admin"):
+        return {"ok": False, "причина": "удержание поставлено Мостом — менять может только он"}
+    # 🔴 Удержание отзывает конфликтующие аренды и поднимает поколение: иначе тот,
+    # кто уже держит ресурс, продолжит работу как ни в чём не бывало.
+    revoked = []
+    for res, agent in con.execute("SELECT resource, agent_id FROM leases").fetchall():
+        if conflicts_with(r, res):
+            con.execute("DELETE FROM leases WHERE resource=?", (res,))
+            bump(con, res)
+            revoked.append({"resource": res, "был": agent})
+            log(con, agent, None, "lease_revoked_by_hold",
+                {"resource": res, "удержание": r})
     con.execute("INSERT INTO holds VALUES(?,?,?,?,?,?) ON CONFLICT(resource) DO UPDATE "
                 "SET reason=excluded.reason, expires_at=excluded.expires_at,"
                 "approved_by=excluded.approved_by, created_by=excluded.created_by,"
@@ -485,8 +514,9 @@ def hold_add(con, d):
                  d.get("agent_id", "") if d.get("_admin") else "",
                  now(), int(exp or 0)))
     log(con, d.get("agent_id"), None, "hold_set",
-        {"resource": r, "причина": d.get("reason", ""), "до": exp})
-    return {"ok": True, "resource": r}
+        {"resource": r, "причина": d.get("reason", ""), "до": exp,
+         "отозвано_аренд": len(revoked)})
+    return {"ok": True, "resource": r, "отозванные_аренды": revoked}
 
 
 def hold_del(con, d):

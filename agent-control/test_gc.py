@@ -617,6 +617,91 @@ def main():
         con23.close()
         m.DB = saved_db
 
+        print("")
+        print("31. Общий /tmp защищён и на стадии удаления, не только карантина")
+        con24 = m.db()
+        f3 = os.path.join(sandbox, "tmp", "старый-карантин.log")
+        open(f3, "w").write("x")
+        age(f3, 400)
+        m.scan(con24)
+        u8 = con24.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                           (f3,)).fetchone()[0]
+        m.to_state(con24, u8, "EXPIRED", "просрочен")
+        backdate(m, con24, u8, 100)
+        m.advance(con24, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        st = con24.execute("SELECT state, quarantine_path FROM resources WHERE uuid=?",
+                           (u8,)).fetchone()
+        if st[0] == "QUARANTINED":
+            # теперь объявляем этот путь общим /tmp задним числом — так выглядит
+            # строка, оставшаяся от прошлой версии или восстановления
+            saved_ro2, m.REPORT_ONLY = m.REPORT_ONLY, (os.path.join(sandbox, "tmp"),)
+            backdate(m, con24, u8, 10000)
+            m.advance(con24, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+            st2 = con24.execute("SELECT state FROM resources WHERE uuid=?",
+                                (u8,)).fetchone()
+            check("🔴 карантинная строка из общего /tmp не удаляется",
+                  st2[0] == "QUARANTINED", st2)
+            check("файл в карантине цел", os.path.exists(st[1]))
+            m.REPORT_ONLY = saved_ro2
+        else:
+            check("карантинная строка из общего /tmp не удаляется", False, st)
+
+        print("")
+        print("32. Исчезновение тома одной зоны делает обход неполным")
+        zone2 = os.path.join(m.AGENTS_DIR, "exec9")
+        os.makedirs(os.path.join(zone2, "work"), exist_ok=True)   # зона полна
+        m.ZONES_FILE = os.path.join(m.ROOT, "zones.txt")
+        open(m.ZONES_FILE, "w", encoding="utf-8").write(zone2 + chr(10))
+        rs, ok = m.roots()
+        check("🔴 зона без своего тома признана неисправной", ok is False,
+              "том зоны отвалился, а обход считает себя полным")
+        good, why = m.zone_ok(zone2)
+        check("причина названа — зона не на своём томе",
+              not good and "том" in why, why)
+        # а если зону убрать совсем — тоже неполный обход, а не «зоны нет»
+        os.rename(os.path.join(zone2, "agent.env"), os.path.join(zone2, "agent.env.off"))
+        rs, ok2 = m.roots()
+        check("🔴 исчезнувший agent.env не значит «зоны больше нет»",
+              ok2 is False, ok2)
+        os.rename(os.path.join(zone2, "agent.env.off"), os.path.join(zone2, "agent.env"))
+        open(m.ZONES_FILE, "w", encoding="utf-8").write("")
+
+        print("")
+        print("33. Личный репозиторий поверх архива через alternates")
+        personal = os.path.join(sandbox, "личный.git")
+        sh("git", "init", "--bare", "-q", personal)
+        os.makedirs(os.path.join(personal, "objects", "info"), exist_ok=True)
+        open(os.path.join(personal, "objects", "info", "alternates"), "w").write(
+            os.path.join(m.STORE, "objects") + chr(10))
+        sh("git", "-C", personal, "fetch", "-q", m.STORE, "+refs/heads/main:refs/heads/main")
+        wt8 = os.path.join(sandbox, "work", "личная-копия")
+        r = sh("git", "-C", personal, "worktree", "add", "-q", "-b", "личн", wt8, "main")
+        check("копия создана из личного репозитория", r.returncode == 0, r.stderr[:120])
+        got = sh("git", "-C", wt8, "log", "--oneline", "-1")
+        check("общая история читается через alternates", got.returncode == 0, got.stderr[:120])
+        parent = m.parent_repo(wt8)
+        check("🔴 родителем считается ЛИЧНЫЙ репозиторий, а не архив",
+              parent == os.path.realpath(personal), f"{parent} против {personal}")
+        age(wt8, 400)
+        con25 = m.db()
+        m.scan(con25)
+        u9 = con25.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                           (wt8,)).fetchone()[0]
+        m.to_state(con25, u9, "EXPIRED", "просрочена")
+        backdate(m, con25, u9, 100)
+        m.advance(con25, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        st = con25.execute("SELECT state, quarantine_path FROM resources WHERE uuid=?",
+                           (u9,)).fetchone()
+        check("🔴 копия из личного репозитория уходит в карантин",
+              st[0] == "QUARANTINED", st)
+        refs = sh("git", "-C", m.STORE, "for-each-ref", "--format=%(refname)",
+                  "refs/rescue").stdout
+        check("🔴 спасательная ссылка создана в АРХИВЕ, не в личном",
+              "refs/rescue" in refs, refs[:80])
+        own = sh("git", "-C", personal, "for-each-ref", "--format=%(refname)",
+                 "refs/rescue").stdout
+        check("в личном репозитории спасательных ссылок нет", not own.strip(), own[:80])
+
         print(f"\nИТОГ: {N[1]} из {N[0]}")
         return 0 if N[1] == N[0] else 1
     finally:

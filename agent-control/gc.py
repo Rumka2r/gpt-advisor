@@ -349,12 +349,21 @@ def db():
                 # 🔴 Сначала слить WAL, иначе незаписанные изменения старой базы
                 # пропадут; и унести sidecar-файлы вместе с ней, иначе они
                 # останутся рядом с новой и будут считаться её журналом.
+                # 🔴 Слияние журнала может вернуть «занято» БЕЗ исключения —
+                # результат надо читать. По собственному правилу «не удалось
+                # проверить — не трогаем» здесь прекращаем работу, а не
+                # продолжаем с непонятной базой.
                 try:
                     fix = sqlite3.connect(DB, timeout=30)
-                    fix.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    busy, _, _ = fix.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                     fix.close()
-                except sqlite3.Error:
-                    pass
+                except sqlite3.Error as e:
+                    raise SystemExit(f"🔴 старую базу не удалось прочитать ({e}) — "
+                                     f"разберись вручную, ничего не трогаю")
+                if busy:
+                    raise SystemExit("🔴 старую базу держит другой процесс "
+                                     "(журнал не слит) — ничего не трогаю")
                 aside = DB + ".old-" + time.strftime("%Y%m%dT%H%M%S")
                 os.replace(DB, aside)
                 for suf in ("-wal", "-shm"):
@@ -366,8 +375,9 @@ def db():
                 # чужой журнал, и она будет читаться неверно.
                 stray = [DB + s for s in ("-wal", "-shm") if os.path.exists(DB + s)]
                 if stray:
-                    print("🔴 журнал старой базы воссоздан — её кто-то держит: "
-                          + ", ".join(stray))
+                    raise SystemExit(
+                        "🔴 журнал старой базы воссоздан — её кто-то держит: "
+                        + ", ".join(stray) + ". Ничего не трогаю.")
         except sqlite3.Error:
             pass
     con = sqlite3.connect(DB, timeout=30)
@@ -408,6 +418,46 @@ def to_state(con, uuid, new, reason, **fields):
 
 # ── Обход ───────────────────────────────────────────────────────────────────
 
+ZONES_FILE = os.path.join(ROOT, "zones.txt")
+
+
+def expected_zones():
+    """Зоны, которые ДОЛЖНЫ существовать — из отдельного реестра, а не из того,
+    что сейчас видно на диске.
+
+    🔴 Иначе отвал тома зоны выглядит как «зоны больше нет»: точка монтирования
+    остаётся, а `agent.env` вместе с содержимым исчезает, и обход считает себя
+    полным. Реестр ведёт провижининг, сборщик его только читает."""
+    out = []
+    try:
+        with open(ZONES_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    out.append(line)
+    except OSError:
+        pass
+    return out
+
+
+def zone_ok(zone):
+    """Зона на месте и это её собственный том? Возвращает (да, пояснение)."""
+    if not os.path.isdir(zone):
+        return False, "каталог зоны отсутствует"
+    if not os.path.exists(os.path.join(zone, "agent.env")):
+        return False, "нет agent.env — похоже, том отвалился"
+    for sub in ("tmp", "cache", "work"):
+        if not os.path.isdir(os.path.join(zone, sub)):
+            return False, f"нет каталога {sub}"
+    try:
+        # у зоны свой том: устройство её каталога обязано отличаться от корня
+        if os.stat(zone).st_dev == os.stat(AGENTS_DIR).st_dev:
+            return False, "зона не на своём томе — том не смонтирован"
+    except OSError as e:
+        return False, f"не удалось проверить устройство: {e}"
+    return True, ""
+
+
 def roots():
     """Корни обхода. Возвращает (список, всё_ли_прочитано).
 
@@ -416,6 +466,14 @@ def roots():
     не проверялись вообще. А если том зоны отвалился, её ресурсы ещё и выглядят
     исчезнувшими."""
     out = list(BASE_ROOTS)
+    ok = True
+    # Сначала — ожидаемые зоны из реестра: их отсутствие означает поломку,
+    # а не «зоны больше нет».
+    for zone in expected_zones():
+        good, why = zone_ok(zone)
+        if not good:
+            print(f"🔴 ожидаемая зона {zone} не в порядке: {why}")
+            ok = False
     if not os.path.isdir(AGENTS_DIR):
         return out, False
     try:
@@ -433,7 +491,7 @@ def roots():
                     out.append((p, "tmp_generic"))
         except OSError:
             return out, False
-    return out, True
+    return out, ok
 
 
 def roots_invariant_ok(rs):
@@ -1034,6 +1092,16 @@ def advance(con, disk, apply_, scan_res):
         if hold:
             to_state(con, uid, "QUARANTINED", f"🔴 удержание: {hold}",
                      quarantine_path=qp)
+            continue
+        # 🔴 Тот же страж, что и перед карантином. Строка в состоянии
+        # QUARANTINED могла появиться от прошлой версии, восстановления или
+        # вручную — и её исходный путь может лежать в общем /tmp, где владельца
+        # нет. Без этой проверки такой ресурс удалялся бы, минуя запрет.
+        if apply_ and report_only(path):
+            to_state(con, uid, "QUARANTINED",
+                     "🔴 исходный путь в общем /tmp — только показ",
+                     quarantine_path=qp)
+            acted.append(("только показ", qp or path, "общий /tmp не удаляю", size))
             continue
         if not apply_:
             acted.append(("показ", qp or path, "удалить из карантина", size))

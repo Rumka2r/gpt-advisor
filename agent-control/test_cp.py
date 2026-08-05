@@ -162,5 +162,33 @@ if w.get("ok"):
     call("/release", lease_token=w["lease_token"])
 
 print("")
+print("12. Позднее удержание останавливает уже начатую работу")
+res12 = "branch:" + uuid.uuid4().hex[:8]
+g12 = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-12",
+           resources=[res12])
+check("аренда взята", g12.get("ok"), g12)
+c = call("/check", resource=res12, lease_token=g12["lease_token"],
+         fencing_token=g12["fencing"][res12])
+check("до удержания право есть", c.get("allow"), c)
+h = call("/hold", resource=res12, reason="расследование",
+         expires_at=int(time.time()) + 3600)
+check("удержание поставлено", h.get("ok"), h)
+check("удержание отозвало аренду", h.get("отозванные_аренды"), h)
+c = call("/check", resource=res12, lease_token=g12["lease_token"],
+         fencing_token=g12["fencing"][res12])
+check("после удержания право отобрано", not c.get("allow"), c)
+call("/unhold", resource=res12)
+
+print("")
+print("13. Удержание закрывает и вложенные пути")
+z13 = uuid.uuid4().hex[:8]
+call("/hold", resource=f"path:backend/{z13}", reason="зона под расследованием",
+     expires_at=int(time.time()) + 3600)
+r13 = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-13",
+           resources=[f"path:backend/{z13}/models.py"])
+check("файл внутри удержанной зоны не выдан", not r13.get("ok"), r13)
+call("/unhold", resource=f"path:backend/{z13}")
+
+print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")
 sys.exit(0 if N[1] == N[0] else 1)
