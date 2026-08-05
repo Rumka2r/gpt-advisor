@@ -76,6 +76,18 @@ KINDS = {
     "worktree": dict(ttl_h=168, grace_h=24, purge_h=72, min_h=6),
 }
 
+# 🔴 Пути, для которых аренду взять НЕ У КОГО: в общем /tmp нет владельца,
+# и захват выдуманного имени не мешает никому начать пользоваться каталогом
+# между проверкой и переносом. Такие ресурсы только показываем.
+REPORT_ONLY = ("/tmp",)
+
+
+def report_only(path):
+    z = path.startswith(AGENTS_DIR + os.sep)
+    return (not z) and any(path == r or path.startswith(r.rstrip("/") + "/")
+                           for r in REPORT_ONLY)
+
+
 BASE_ROOTS = [
     ("/tmp/claude-1000", "session_cache"),
     ("/tmp", "tmp_generic"),
@@ -334,9 +346,28 @@ def db():
             cols = {r[1] for r in probe.execute("PRAGMA table_info(resources)")}
             probe.close()
             if cols and not {"uuid", "live", "generation"} <= cols:
+                # 🔴 Сначала слить WAL, иначе незаписанные изменения старой базы
+                # пропадут; и унести sidecar-файлы вместе с ней, иначе они
+                # останутся рядом с новой и будут считаться её журналом.
+                try:
+                    fix = sqlite3.connect(DB, timeout=30)
+                    fix.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    fix.close()
+                except sqlite3.Error:
+                    pass
                 aside = DB + ".old-" + time.strftime("%Y%m%dT%H%M%S")
                 os.replace(DB, aside)
+                for suf in ("-wal", "-shm"):
+                    if os.path.exists(DB + suf):
+                        os.replace(DB + suf, aside + suf)
                 print(f"старая база несовместима, отложена: {aside}")
+                # 🔴 Журнал появился снова — значит старую базу кто-то ещё
+                # держит открытой. Это не «мелочь»: рядом с новой базой окажется
+                # чужой журнал, и она будет читаться неверно.
+                stray = [DB + s for s in ("-wal", "-shm") if os.path.exists(DB + s)]
+                if stray:
+                    print("🔴 журнал старой базы воссоздан — её кто-то держит: "
+                          + ", ".join(stray))
         except sqlite3.Error:
             pass
     con = sqlite3.connect(DB, timeout=30)
@@ -378,19 +409,31 @@ def to_state(con, uuid, new, reason, **fields):
 # ── Обход ───────────────────────────────────────────────────────────────────
 
 def roots():
+    """Корни обхода. Возвращает (список, всё_ли_прочитано).
+
+    🔴 Ошибку чтения каталога зон НЕЛЬЗЯ проглатывать: раньше при недоступном
+    /srv/agents возвращались обычные корни и обход считался полным, хотя зоны
+    не проверялись вообще. А если том зоны отвалился, её ресурсы ещё и выглядят
+    исчезнувшими."""
     out = list(BASE_ROOTS)
+    if not os.path.isdir(AGENTS_DIR):
+        return out, False
     try:
-        for name in sorted(os.listdir(AGENTS_DIR)):
-            zone = os.path.join(AGENTS_DIR, name)
+        names = sorted(os.listdir(AGENTS_DIR))
+    except OSError:
+        return out, False
+    for name in names:
+        zone = os.path.join(AGENTS_DIR, name)
+        try:
             if not os.path.exists(os.path.join(zone, "agent.env")):
                 continue
             for sub in ("tmp", "cache"):
                 p = os.path.join(zone, sub)
                 if os.path.isdir(p):
                     out.append((p, "tmp_generic"))
-    except OSError:
-        pass
-    return out
+        except OSError:
+            return out, False
+    return out, True
 
 
 def roots_invariant_ok(rs):
@@ -500,7 +543,7 @@ def dir_size(path):
 
 def scan(con):
     """Возвращает {'roots_ok': bool, 'failed': [...], 'read': n}."""
-    all_roots = roots()
+    all_roots, zones_ok = roots()
     ok_inv, why_inv = roots_invariant_ok(all_roots)
     if not ok_inv:
         return dict(roots_ok=False, failed=["инвариант: " + why_inv], read=0)
@@ -509,6 +552,8 @@ def scan(con):
     holds, holds_ok = holds_now()
     declared = {r[0].rstrip("/") for r in all_roots}
     failed, read_roots, seen_paths = [], [], set()
+    if not zones_ok:
+        failed.append(f"{AGENTS_DIR}: каталог зон не прочитан")
 
     for root, kind in all_roots:
         try:
@@ -597,6 +642,11 @@ def scan(con):
                 continue
             if not qpath:
                 continue
+            # 🔴 Отсутствие карантинного пути НЕ означает, что его удалили:
+            # у зоны исполнителя отдельный том, и при его отвале разом «исчезли
+            # бы» все её ресурсы. Пока корень карантина недоступен — не решаем.
+            if not os.path.isdir(os.path.dirname(qpath)):
+                continue
             to_state(con, uid, "DELETED", "карантинный каталог исчез", live=0)
             continue
         if state in ("ACTIVE", "EXPIRED") and under_read and not os.path.exists(path):
@@ -611,7 +661,8 @@ def safe_location(path):
     real = os.path.realpath(path)
     if real != os.path.abspath(path) or os.path.islink(path):
         return False, "путь не канонический или является ссылкой"
-    allowed = list(ALLOWED_ROOTS) + [z[0] for z in roots()
+    zone_roots, _ = roots()          # roots() теперь возвращает (список, полнота)
+    allowed = list(ALLOWED_ROOTS) + [z[0] for z in zone_roots
                                      if z[0].startswith(AGENTS_DIR + "/")]
     if not any(real == r or real.startswith(r.rstrip("/") + "/") for r in allowed):
         return False, f"вне разрешённых корней: {real}"
@@ -665,8 +716,16 @@ def validate_worktree(path):
                     "--exclude-standard", "--directory"], timeout=300)
     if code != 0:
         return False, "не удалось перечислить игнорируемые файлы"
-    unknown = [l for l in out.splitlines() if l.strip() and not any(
-        l.rstrip("/").endswith(d) or f"/{d}/" in l for d in DISPOSABLE)]
+    # 🔴 Сравниваем ЦЕЛЫЕ составляющие пути. По концу строки `customer-dist`
+    # и `important-prebuild` считались одноразовыми `dist` и `build` — и копия
+    # с ними была бы удалена как «ничего ценного».
+    unknown = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = [x for x in line.rstrip("/").split("/") if x]
+        if not any(x in DISPOSABLE for x in parts):
+            unknown.append(line)
     if unknown:
         return False, f"игнорируемые файлы неизвестного назначения: {unknown[0]}"
 
@@ -914,6 +973,12 @@ def advance(con, disk, apply_, scan_res):
         if hold:
             to_state(con, uid, "ACTIVE", f"🔴 удержание: {hold}")
             continue
+        if apply_ and report_only(path):
+            to_state(con, uid, "EXPIRED",
+                     "🔴 общий /tmp: владельца нет, аренду взять не у кого — "
+                     "только показ")
+            acted.append(("только показ", path, "общий /tmp не убираю", size))
+            continue
         if not apply_:
             ok, why = (validate_worktree(path) if kind == "worktree" else (True, ""))
             acted.append(("показ", path,
@@ -1045,7 +1110,11 @@ def rescue_cleanup(con, apply_):
         # отказа удаления, ссылка обязана её пережить.
         row = con.execute("SELECT state FROM resources WHERE uuid=?",
                           (res_uuid,)).fetchone()
-        if row and row[0] != "DELETED":
+        # 🔴 Нет строки ресурса — тем более не удаляем: это значит, что учёт
+        # потерян (частично восстановленная база), а ссылка может быть последней
+        # копией работы. Раньше здесь было `row and ...`, то есть отсутствие
+        # строки РАЗРЕШАЛО удаление.
+        if not row or row[0] != "DELETED":
             continue
         days = int((now() - at) / 86400)
         if not apply_:

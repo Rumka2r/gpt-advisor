@@ -31,7 +31,14 @@ def sh(*cmd, cwd=None):
 
 def load(sandbox):
     """Загрузить сборщик и увести ВСЕ его пути в песочницу."""
-    src = os.environ.get("GC_SRC", "/opt/agent-control/gc.py")
+    # 🔴 Проверяем ИМЕННО тот файл, что лежит рядом с тестом. Раньше по
+    # умолчанию грузилась установленная копия из /opt — и зелёный результат
+    # ничего не говорил о коде в репозитории.
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gc.py")
+    src = os.environ.get("GC_SRC", here)
+    assert os.path.abspath(src) == os.path.abspath(here) or "GC_SRC" in os.environ, \
+        "проверяется не соседний gc.py"
+    print(f"проверяется файл: {src}")
     spec = importlib.util.spec_from_file_location("gcmod", src)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
@@ -49,6 +56,9 @@ def load(sandbox):
     m.BASE_ROOTS = [(os.path.join(sandbox, "work"), "worktree"),
                     (os.path.join(sandbox, "tmp"), "tmp_generic")]
     m.NEVER = (m.QUARANTINE, m.STORE)
+    # песочница физически лежит в /tmp, но правило «общий /tmp только показываем»
+    # к ней не относится: иначе тесты проверяли бы отказ, а не работу
+    m.REPORT_ONLY = ("/несуществующий-корень",)
     # координатор в тестах подменяем: настоящий трогать нельзя
     m._cp_up = True
     m._holds = set()
@@ -76,7 +86,10 @@ def load(sandbox):
 
 
 def make_repo(sandbox, name, dirty=False):
-    """Настоящий bare-архив + рабочая копия — чтобы проверялись реальные пути git."""
+    """Настоящий bare-архив + личный репозиторий исполнителя поверх него через
+    alternates + рабочая копия. Так же, как на сервере: архив только для чтения,
+    пишет исполнитель к себе. Раньше тест использовал один репозиторий и в роли
+    архива, и в роли личного — и не воспроизводил главного разделения."""
     store = os.path.join(sandbox, "store.git")
     if not os.path.exists(store):
         sh("git", "init", "--bare", "-q", store)
@@ -130,6 +143,10 @@ def main():
         os.makedirs(os.path.join(sandbox, "work"))
         os.makedirs(os.path.join(sandbox, "tmp"))
         m = load(sandbox)
+        # 🔴 Глобальный конфиг не трогаем: тест не имеет права навсегда
+        # разрешать «доверять любому репозиторию» на машине. Настройка живёт
+        # только внутри песочницы.
+        os.environ["GIT_CONFIG_GLOBAL"] = os.path.join(sandbox, "gitconfig")
         sh("git", "config", "--global", "--add", "safe.directory", "*")
 
         print("1. Режим показа ничего не меняет")
@@ -392,7 +409,7 @@ def main():
         os.makedirs(junk, exist_ok=True)
         open(os.path.join(junk, "f"), "w").write("x")
         age(junk, 400)
-        rs = [r[0] for r in m.roots()]
+        rs = [r[0] for r in m.roots()[0]]
         check("\U0001f534 корни зоны попали в обход",
               os.path.join(zone, "tmp") in rs, rs)
         con14 = m.db()
@@ -477,6 +494,127 @@ def main():
               {"uuid", "live", "generation"} <= cols, cols)
         aside = [f for f in os.listdir(m.ROOT) if f.startswith("старая.db.old-")]
         check("старая база сохранена рядом", bool(aside), os.listdir(m.ROOT))
+        m.DB = saved_db
+
+        print("")
+        print("26. Недоступный карантин не закрывает ресурсы")
+        con20 = m.db()
+        row = con20.execute("SELECT uuid, quarantine_path FROM resources "
+                            "WHERE state='QUARANTINED' AND live=1").fetchone()
+        if row:
+            uq, qp = row
+            saved = m.QUARANTINE
+            os.rename(m.QUARANTINE, m.QUARANTINE + "-унесён")
+            m.scan(con20)
+            st = con20.execute("SELECT state FROM resources WHERE uuid=?", (uq,)).fetchone()
+            os.rename(m.QUARANTINE + "-унесён", saved)
+            check("\U0001f534 при недоступном карантине состояние сохранено",
+                  st[0] == "QUARANTINED", st)
+        else:
+            check("при недоступном карантине состояние сохранено", False, "нет карантина")
+
+        print("")
+        print("27. Недоступный каталог зон делает обход неполным")
+        saved_agents = m.AGENTS_DIR
+        m.AGENTS_DIR = os.path.join(sandbox, "нет-зон")
+        rs, ok = m.roots()
+        check("\U0001f534 недоступные зоны видны как непрочитанные", ok is False, ok)
+        con21 = m.db()
+        res = m.scan(con21)
+        check("обход честно неполон", not res["roots_ok"], res)
+        out = m.advance(con21, m.disk_state(), True, res)
+        check("\U0001f534 удаление при этом запрещено",
+              any("корни не прочитаны" in str(x[2]) for x in out), out)
+        m.AGENTS_DIR = saved_agents
+
+        print("")
+        print("28. Похожие имена не считаются одноразовыми")
+        wt7 = make_repo(sandbox, "похожие")
+        for name in ("customer-dist", "important-prebuild"):
+            open(os.path.join(wt7, name), "w").write("ценное\n")
+        open(os.path.join(wt7, ".gitignore"), "w").write("customer-dist\nimportant-prebuild\n")
+        sh("git", "-C", wt7, "add", ".gitignore")
+        sh("git", "-C", wt7, "-c", "user.email=t@t", "-c", "user.name=t",
+           "commit", "-qm", "правила игнорирования")
+        ok, why = m.validate_worktree(wt7)
+        check("\U0001f534 customer-dist и important-prebuild удерживают копию",
+              not ok and "неизвестного назначения" in why, why)
+
+        print("")
+        print("29. Общий /tmp только показывается, но не убирается")
+        # в песочнице правило подменено (она сама лежит в /tmp) — проверяем
+        # настоящее значение, а не подменённое
+        real_ro, m.REPORT_ONLY = m.REPORT_ONLY, ("/tmp",)
+        check("\U0001f534 /tmp помечен как только показ", m.report_only("/tmp/что-то"))
+        m.REPORT_ONLY = real_ro
+        check("зона исполнителя убирается", not m.report_only(
+            os.path.join(m.AGENTS_DIR, "exec9", "tmp", "х")))
+        con22 = m.db()
+        f2 = os.path.join(sandbox, "tmp", "показать.log")
+        open(f2, "w").write("x")
+        age(f2, 400)
+        saved_ro = m.REPORT_ONLY
+        m.REPORT_ONLY = (os.path.join(sandbox, "tmp"),)
+        m.scan(con22)
+        u7 = con22.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                           (f2,)).fetchone()[0]
+        m.to_state(con22, u7, "EXPIRED", "просрочен")
+        backdate(m, con22, u7, 100)
+        m.advance(con22, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        check("\U0001f534 файл в общем /tmp не перенесён", os.path.exists(f2))
+        m.REPORT_ONLY = saved_ro
+
+        print("")
+        print("30. Миграция базы с незаписанным журналом")
+        import sqlite3 as _s3
+        old = os.path.join(m.ROOT, "старая2.db")
+        c = _s3.connect(old)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE resources(path TEXT PRIMARY KEY, kind TEXT)")
+        c.execute("INSERT INTO resources VALUES('/x','tmp')")
+        c.commit()
+        check("журнал существует до миграции", os.path.exists(old + "-wal"))
+        c.close()
+        # 🔴 Честная имитация аварии: снимаем копию базы ВМЕСТЕ с живым журналом,
+        # пока владелец её ещё держит. Так выглядит база после падения процесса.
+        # (Затирать журнал мусором нельзя — это уничтожает данные самим тестом,
+        # и проверка тогда доказывает не то.)
+        live = os.path.join(m.ROOT, "живая.db")
+        c2 = _s3.connect(live)
+        c2.execute("PRAGMA journal_mode=WAL")
+        c2.execute("CREATE TABLE resources(path TEXT PRIMARY KEY, kind TEXT)")
+        c2.execute("INSERT INTO resources VALUES('/x','tmp')")
+        c2.commit()
+        c2.execute("INSERT INTO resources VALUES('/y','tmp')")
+        c2.commit()
+        for suf in ("", "-wal", "-shm"):
+            if os.path.exists(live + suf):
+                shutil.copy2(live + suf, old + suf)
+        c2.close()
+        check("аварийный журнал скопирован", os.path.exists(old + "-wal"))
+        saved_db = m.DB
+        m.DB = old
+        con23 = m.db()
+        aside = sorted(f for f in os.listdir(m.ROOT) if f.startswith("старая2.db.old-"))
+        check("\U0001f534 старая база отложена", bool(aside), os.listdir(m.ROOT))
+        # 🔴 Главное — не «куда уехал журнал», а что данные СТАРОЙ базы целы:
+        # перед переносом журнал вливается в неё, поэтому рядом с новой базой
+        # чужого журнала не остаётся, а записи сохраняются в отложенной копии.
+        rows = []
+        if aside:
+            chk = _s3.connect(os.path.join(m.ROOT, aside[0]))
+            rows = [r[0] for r in chk.execute("SELECT path FROM resources")]
+            chk.close()
+        check("\U0001f534 данные старой базы сохранены при переносе",
+              sorted(rows) == ["/x", "/y"], rows)
+        left = [f for f in os.listdir(m.ROOT) if f in ("старая2.db-wal", "старая2.db-shm")]
+        if left:
+            # новая база в режиме WAL заводит СВОЙ журнал — он должен быть пустым
+            # от старого содержимого
+            got = open(os.path.join(m.ROOT, left[0]), "rb").read(60)
+            check("оставшийся журнал принадлежит новой базе",
+                  "аварийного".encode() not in got, got[:30])
+        con23.close()
         m.DB = saved_db
 
         print(f"\nИТОГ: {N[1]} из {N[0]}")

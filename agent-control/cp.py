@@ -300,12 +300,19 @@ def acquire(con, d):
     try:
         sweep(con)
         busy = []
+        # 🔴 Удержание сравниваем ПО ПЕРЕСЕЧЕНИЮ, а не по точному совпадению имени:
+        # удержание на `path:backend/warehouse` обязано закрывать и файл внутри
+        # него. Иначе зона под расследованием защищена только целиком.
+        active_holds = con.execute(
+            "SELECT resource, reason FROM holds WHERE expires_at=0 OR expires_at>?",
+            (t,)).fetchall()
         for r in resources:
-            row = con.execute("SELECT reason FROM holds WHERE resource=? AND "
-                              "(expires_at=0 OR expires_at>?)", (r, t)).fetchone()
-            if row:
+            hit = next(((hr, hres) for hr, hres in active_holds
+                        if conflicts_with(r, hr)), None)
+            if hit:
                 con.execute("ROLLBACK")
-                return {"ok": False, "причина": f"ресурс {r} под удержанием: {row[0]}"}
+                return {"ok": False,
+                        "причина": f"ресурс {r} закрыт удержанием {hit[0]}: {hit[1]}"}
         held = con.execute("SELECT resource, agent_id, instance_id, expires "
                            "FROM leases").fetchall()
         for r in resources:
@@ -521,11 +528,12 @@ def gc_claim(con, d):
     con.execute("BEGIN IMMEDIATE")
     try:
         sweep(con)
-        row = con.execute("SELECT resource FROM holds WHERE resource=? AND "
-                          "(expires_at=0 OR expires_at>?)", (r, t)).fetchone()
-        if row:
+        held = con.execute("SELECT resource FROM holds WHERE expires_at=0 OR "
+                           "expires_at>?", (t,)).fetchall()
+        hit = next((h[0] for h in held if conflicts_with(r, h[0])), None)
+        if hit:
             con.execute("ROLLBACK")
-            return {"ok": False, "причина": "ресурс под удержанием"}
+            return {"ok": False, "причина": f"ресурс закрыт удержанием {hit}"}
         for hr, ha, he in con.execute("SELECT resource, agent_id, expires FROM leases"):
             if conflicts_with(r, hr):
                 con.execute("ROLLBACK")
