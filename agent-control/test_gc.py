@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Регрессии сборщика: по одной на каждый дефект, который нашёл архитектор.
+Всё в отдельной песочнице — настоящие каталоги, настоящий git, но НИ ОДНОГО
+пути рабочей системы: модуль переопределяется целиком перед запуском.
+"""
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+N = [0, 0]
+
+
+def check(name, cond, detail=""):
+    N[0] += 1
+    if cond:
+        N[1] += 1
+        print(f"  ✔ {name}")
+    else:
+        print(f"  ✘ {name}   {detail}")
+
+
+def sh(*cmd, cwd=None):
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+
+def load(sandbox):
+    """Загрузить сборщик и увести ВСЕ его пути в песочницу."""
+    src = os.environ.get("GC_SRC", "/opt/agent-control/gc.py")
+    spec = importlib.util.spec_from_file_location("gcmod", src)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.ROOT = os.path.join(sandbox, "control")
+    os.makedirs(m.ROOT, exist_ok=True)
+    m.DB = os.path.join(m.ROOT, "gc.db")
+    m.LOCKFILE = os.path.join(m.ROOT, "gc.lock")
+    m.STATE_DIR = os.path.join(m.ROOT, "state")
+    m.HOLD_FILE = os.path.join(m.ROOT, "hold.txt")
+    m.QUARANTINE = os.path.join(sandbox, "quarantine")
+    m.STORE = os.path.join(sandbox, "store.git")
+    m.AGENTS_DIR = os.path.join(sandbox, "agents")
+    m.ALLOWED_ROOTS = (os.path.join(sandbox, "work"),
+                       os.path.join(sandbox, "tmp"))
+    m.BASE_ROOTS = [(os.path.join(sandbox, "work"), "worktree"),
+                    (os.path.join(sandbox, "tmp"), "tmp_generic")]
+    m.NEVER = (m.QUARANTINE, m.STORE)
+    # координатор в тестах подменяем: настоящий трогать нельзя
+    m._cp_up = True
+    m._holds = set()
+    m._fencing_ok = True
+
+    def fake_cp(path, **p):
+        if not m._cp_up:
+            return None
+        if path == "/gc/claim":
+            return {"ok": True, "lease_token": "t",
+                    "fencing": {p.get("resource"): 1}}
+        if path == "/holds":
+            return {"ok": True,
+                    "удержания": [{"resource": "worktree:" + h} for h in m._holds]}
+        if path == "/check":
+            return ({"allow": True} if m._fencing_ok
+                    else {"allow": False, "причина": "поколение устарело"})
+        if path == "/heartbeat":
+            return {"ok": True} if m._fencing_ok else {"ok": False,
+                                                       "причина": "аренда истекла"}
+        return {"ok": True}
+
+    m.cp = fake_cp
+    return m
+
+
+def make_repo(sandbox, name, dirty=False):
+    """Настоящий bare-архив + рабочая копия — чтобы проверялись реальные пути git."""
+    store = os.path.join(sandbox, "store.git")
+    if not os.path.exists(store):
+        sh("git", "init", "--bare", "-q", store)
+        seed = os.path.join(sandbox, "seed")
+        sh("git", "init", "-q", "-b", "main", seed)
+        open(os.path.join(seed, "f.txt"), "w").write("исходный\n")
+        sh("git", "add", ".", cwd=seed)
+        sh("git", "-c", "user.email=t@t", "-c", "user.name=t",
+           "commit", "-qm", "первый", cwd=seed)
+        sh("git", "push", "-q", store, "main", cwd=seed)
+        sh("git", "config", "gc.auto", "0", cwd=store)
+        sh("git", "config", "gc.pruneExpire", "never", cwd=store)
+    wt = os.path.join(sandbox, "work", name)
+    # ветка должна быть уникальной: копию с тем же именем создаём повторно,
+    # когда проверяем занятость пути
+    br = "b/" + name
+    n = 1
+    while sh("git", "-C", store, "rev-parse", "--verify", "--quiet", br).returncode == 0:
+        n += 1
+        br = f"b/{name}-{n}"
+    r = sh("git", "-C", store, "worktree", "add", "-q", "-b", br, wt, "main")
+    if r.returncode != 0:
+        raise RuntimeError("не удалось создать копию: " + r.stderr[:200])
+    if dirty:
+        open(os.path.join(wt, "мусор.txt"), "w").write("не закоммичено\n")
+    return wt
+
+
+def backdate(m, con, uid, hours):
+    """Состарить момент перехода: выдержка считается от него, а не от файлов."""
+    con.execute("UPDATE resources SET state_since=? WHERE uuid=?",
+                (int(time.time()) - int(hours * 3600), uid))
+    con.commit()
+
+
+def age(path, hours):
+    t = time.time() - hours * 3600
+    for dirpath, dirs, files in os.walk(path):
+        for n in files + dirs:
+            p = os.path.join(dirpath, n)
+            try:
+                os.utime(p, (t, t), follow_symlinks=False)
+            except OSError:
+                pass
+    os.utime(path, (t, t))
+
+
+def main():
+    sandbox = tempfile.mkdtemp(prefix="gc-test-")
+    try:
+        os.makedirs(os.path.join(sandbox, "work"))
+        os.makedirs(os.path.join(sandbox, "tmp"))
+        m = load(sandbox)
+        sh("git", "config", "--global", "--add", "safe.directory", "*")
+
+        print("1. Режим показа ничего не меняет")
+        wt = make_repo(sandbox, "старая")
+        age(wt, 400)
+        con = m.db()
+        m.scan(con)
+        refs_before = sh("git", "-C", m.STORE, "for-each-ref").stdout
+        d = m.disk_state()
+        m.advance(con, d, False, dict(roots_ok=True, failed=[], read=2))
+        refs_after = sh("git", "-C", m.STORE, "for-each-ref").stdout
+        check("🔴 показ не создаёт спасательных ссылок", refs_before == refs_after,
+              "архив изменился в режиме показа")
+        check("показ не переносит файлы", os.path.exists(wt))
+
+        print("\n2. Грязная копия не удаляется")
+        dirty = make_repo(sandbox, "грязная", dirty=True)
+        ok, why = m.validate_worktree(dirty)
+        check("копия с незакоммиченным отклонена", not ok, why)
+
+        print("\n3. Карантин не превращается в DELETED на следующем обходе")
+        con = m.db()
+        m.scan(con)
+        uid = con.execute("SELECT uuid FROM resources WHERE path=?", (wt,)).fetchone()[0]
+        m.to_state(con, uid, "EXPIRED", "для проверки")
+        backdate(m, con, uid, 100)
+        ok, res = m.advance(con, m.disk_state(), True,
+                            dict(roots_ok=True, failed=[], read=2)), None
+        st = con.execute("SELECT state, quarantine_path FROM resources WHERE uuid=?",
+                         (uid,)).fetchone()
+        check("копия ушла в карантин", st[0] == "QUARANTINED", st)
+        check("карантинный путь по идентификатору",
+              bool(st[1]) and st[1].endswith(uid), st[1])
+        m.scan(con)
+        st2 = con.execute("SELECT state FROM resources WHERE uuid=?", (uid,)).fetchone()
+        check("🔴 после обхода состояние сохранено", st2[0] == "QUARANTINED", st2)
+
+        print("\n4. Время спасения берётся из базы, а не из даты коммита")
+        row = con.execute("SELECT ref, rescued_at FROM rescue").fetchone()
+        check("спасение записано в базу", row is not None)
+        if row:
+            check("время спасения — сейчас, а не дата коммита",
+                  abs(row[1] - int(time.time())) < 120, row)
+
+        print("\n5. Недоступный корень не значит «всё исчезло»")
+        con2 = m.db()
+        saved = m.BASE_ROOTS
+        m.BASE_ROOTS = [(os.path.join(sandbox, "нет-такого"), "worktree")] + saved
+        res = m.scan(con2)
+        check("обход честно сообщает о непрочитанном корне", not res["roots_ok"], res)
+        alive = con2.execute("SELECT COUNT(*) FROM resources WHERE live=1").fetchone()[0]
+        check("ресурсы не помечены исчезнувшими", alive > 0, alive)
+        out = m.advance(con2, m.disk_state(), True, res)
+        check("🔴 при непрочитанном корне удаление запрещено",
+              any("корни не прочитаны" in str(x[2]) for x in out), out)
+        m.BASE_ROOTS = saved
+
+        print("\n6. Недоступный координатор запрещает всё")
+        m._cp_up = False
+        out = m.advance(con2, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        check("🔴 без координатора удаление запрещено",
+              any("координатор недоступен" in str(x[2]) for x in out), out)
+        out = m.rescue_cleanup(con2, True)
+        check("🔴 без координатора спасённое не чистится",
+              any("координатор недоступен" in str(x[2]) for x in out), out)
+        m._cp_up = True
+
+        print("\n7. Удержание останавливает удаление")
+        wt2 = make_repo(sandbox, "удержанная")
+        age(wt2, 400)
+        con3 = m.db()
+        m.scan(con3)
+        uid2 = con3.execute("SELECT uuid FROM resources WHERE path=?", (wt2,)).fetchone()[0]
+        m.to_state(con3, uid2, "EXPIRED", "для проверки")
+        backdate(m, con3, uid2, 100)
+        m._holds = {uid2}
+        m.advance(con3, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        st = con3.execute("SELECT state, reason FROM resources WHERE uuid=?",
+                          (uid2,)).fetchone()
+        check("удержанная копия осталась активной", st[0] == "ACTIVE", st)
+        check("причина названа", "удержание" in (st[1] or ""), st)
+        m._holds = set()
+
+        print("\n8. Восстановление после падения посреди переноса")
+        con4 = m.db()
+        uid3 = con4.execute("SELECT uuid FROM resources WHERE path=?", (wt2,)).fetchone()[0]
+        m.to_state(con4, uid3, "QUARANTINING", "имитация падения",
+                   intended_path=m.qpath_for(uid3))
+        fixed = m.recover(con4)
+        st = con4.execute("SELECT state FROM resources WHERE uuid=?", (uid3,)).fetchone()
+        check("🔴 зависший перенос разобран", st[0] == "ACTIVE", st)
+        check("восстановление названо", any("не состоялся" in f[2] for f in fixed), fixed)
+
+        print("\n9. Повторное использование пути заводит новый экземпляр")
+        con5 = m.db()
+        p = os.path.join(sandbox, "tmp", "повтор")
+        os.makedirs(p, exist_ok=True)
+        open(os.path.join(p, "a"), "w").write("x")
+        age(p, 400)
+        m.scan(con5)
+        u1 = con5.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                          (p,)).fetchone()[0]
+        m.to_state(con5, u1, "DELETED", "имитация", live=0)
+        shutil.rmtree(p)
+        os.makedirs(p)
+        open(os.path.join(p, "b"), "w").write("y")
+        age(p, 400)
+        m.scan(con5)
+        u2 = con5.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                          (p,)).fetchone()
+        check("🔴 новый ресурс по тому же пути замечен", u2 is not None and u2[0] != u1,
+              f"{u1} → {u2}")
+
+        print("\n10. Обычный файл удаляется, а не rmtree")
+        con6 = m.db()
+        f = os.path.join(sandbox, "tmp", "файл.log")
+        open(f, "w").write("мусор")
+        age(f, 400)
+        m.scan(con6)
+        uf = con6.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                          (f,)).fetchone()
+        check("файл попал под учёт", uf is not None)
+        if uf:
+            m.to_state(con6, uf[0], "EXPIRED", "для проверки")
+            backdate(m, con6, uf[0], 100)
+            m.advance(con6, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+            st = con6.execute("SELECT state, quarantine_path FROM resources WHERE uuid=?",
+                              (uf[0],)).fetchone()
+            check("файл перенесён в карантин", st[0] == "QUARANTINED", st)
+            backdate(m, con6, uf[0], 1000)
+            m.advance(con6, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+            st = con6.execute("SELECT state FROM resources WHERE uuid=?",
+                              (uf[0],)).fetchone()
+            check("файл удалён корректно", st[0] == "DELETED", st)
+
+        print("\n11. Минимальная выдержка не обнуляется при переполнении диска")
+        con7 = m.db()
+        wt3 = make_repo(sandbox, "срочная")
+        age(wt3, 400)
+        m.scan(con7)
+        u = con7.execute("SELECT uuid FROM resources WHERE path=?", (wt3,)).fetchone()[0]
+        m.to_state(con7, u, "EXPIRED", "только что просрочена")
+        d = m.disk_state(); d["purge_now"] = True; d["level"] = "emergency"
+        m.advance(con7, d, True, dict(roots_ok=True, failed=[], read=2))
+        st = con7.execute("SELECT state FROM resources WHERE uuid=?", (u,)).fetchone()
+        check("🔴 при 95% свежая просрочка НЕ удаляется мгновенно",
+              st[0] == "EXPIRED", st)
+
+        print("\n12. Архив с alternates не годится для спасения")
+        alt = os.path.join(m.STORE, "objects", "info", "alternates")
+        os.makedirs(os.path.dirname(alt), exist_ok=True)
+        open(alt, "w").write("/куда-то\n")
+        ok, why = m.store_sane()
+        check("🔴 архив со ссылкой наружу отвергнут", not ok, why)
+        os.unlink(alt)
+        ok, why = m.store_sane()
+        check("нормальный архив принят", ok, why)
+
+        print("")
+        print("13. Повторный обход не сбрасывает возраст просрочки")
+        con8 = m.db()
+        wt4 = make_repo(sandbox, "возраст")
+        age(wt4, 400)
+        m.scan(con8)
+        u4 = con8.execute("SELECT uuid FROM resources WHERE path=?", (wt4,)).fetchone()[0]
+        m.to_state(con8, u4, "EXPIRED", "просрочена")
+        backdate(m, con8, u4, 50)
+        was = con8.execute("SELECT state_since FROM resources WHERE uuid=?", (u4,)).fetchone()[0]
+        m.scan(con8)
+        became = con8.execute("SELECT state_since FROM resources WHERE uuid=?", (u4,)).fetchone()[0]
+        check("🔴 возраст просрочки не обнулился обходом", was == became,
+              f"{was} -> {became}: ресурс не дозреет до карантина никогда")
+
+        print("")
+        print("14. Потеря поколения во время проверки останавливает шаг")
+        con9 = m.db()
+        wt5 = make_repo(sandbox, "потеря")
+        age(wt5, 400)
+        m.scan(con9)
+        u5 = con9.execute("SELECT uuid FROM resources WHERE path=?", (wt5,)).fetchone()[0]
+        m.to_state(con9, u5, "EXPIRED", "просрочена")
+        backdate(m, con9, u5, 100)
+        m._fencing_ok = False
+        m.advance(con9, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        st = con9.execute("SELECT state, reason FROM resources WHERE uuid=?", (u5,)).fetchone()
+        check("🔴 при потере права перенос не выполнен", st[0] == "ACTIVE", st)
+        check("копия на месте", os.path.exists(wt5))
+        m._fencing_ok = True
+
+        print("")
+        print("15. Пока старая копия в карантине, путь свободен для новой")
+        con10 = m.db()
+        # после проверки 14 копия вернулась в ACTIVE — снова просрочим её
+        m.to_state(con10, u5, "EXPIRED", "просрочена повторно")
+        backdate(m, con10, u5, 100)
+        m.advance(con10, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+        st = con10.execute("SELECT state FROM resources WHERE uuid=?", (u5,)).fetchone()
+        if st[0] == "QUARANTINED":
+            make_repo(sandbox, "потеря")
+            m.scan(con10)
+            rows = con10.execute("SELECT uuid, state FROM resources WHERE path=? AND live=1",
+                                 (wt5,)).fetchall()
+            fresh = [r for r in rows if r[1] in ("ACTIVE", "EXPIRED")]
+            check("🔴 новая копия на том же пути замечена", len(fresh) == 1, rows)
+        else:
+            check("новая копия на том же пути замечена", False, f"не ушла в карантин: {st}")
+
+        print("")
+        print("16. Живой процесс в карантине запрещает удаление")
+        con11 = m.db()
+        row = con11.execute("SELECT uuid, quarantine_path FROM resources "
+                            "WHERE state='QUARANTINED' AND live=1").fetchone()
+        if row:
+            uq, qp = row
+            backdate(m, con11, uq, 10000)
+            real_held = m.held_paths
+            m.held_paths = lambda: {os.path.join(qp, "чтото")}
+            m.advance(con11, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2))
+            st = con11.execute("SELECT state, reason FROM resources WHERE uuid=?", (uq,)).fetchone()
+            m.held_paths = real_held
+            check("🔴 живой процесс в карантине остановил удаление",
+                  st[0] == "QUARANTINED", st)
+            check("путь на месте", os.path.exists(qp))
+        else:
+            check("живой процесс в карантине остановил удаление", False, "нет карантина")
+
+        print("")
+        print("17. Удержание, появившееся позже, спасает ссылку")
+        con12 = m.db()
+        con12.execute("INSERT OR REPLACE INTO rescue VALUES(?,?,?,?)",
+                      ("refs/rescue/gc/держим/старая", "держим", "0" * 40,
+                       int(time.time()) - 40 * 86400))
+        con12.commit()
+        m._holds = {"держим"}
+        gone = m.rescue_cleanup(con12, True)
+        check("🔴 удержанная ссылка не удалена",
+              not any("держим" in str(g[1]) for g in gone), gone)
+        m._holds = set()
+
+        print("")
+        print("18. Осиротевшая ссылка находится и не удаляется молча")
+        con13 = m.db()
+        sh("git", "-C", m.STORE, "update-ref", "refs/rescue/gc/сирота/1", "main")
+        orph = m.rescue_reconcile(con13)
+        check("🔴 сирота найдена", any("сирота" in o for o in orph), orph)
+        row = con13.execute("SELECT rescued_at FROM rescue WHERE ref LIKE ?",
+                            ("%сирота%",)).fetchone()
+        check("у сироты дата неизвестна", row is not None and row[0] == 0, row)
+        gone = m.rescue_cleanup(con13, True)
+        check("сирота не удалена автоматически",
+              not any("сирота" in str(g[1]) for g in gone), gone)
+
+        print("")
+        print("19. Личные tmp и cache исполнителя вообще сканируются")
+        zone = os.path.join(m.AGENTS_DIR, "exec9")
+        os.makedirs(os.path.join(zone, "tmp"), exist_ok=True)
+        os.makedirs(os.path.join(zone, "cache"), exist_ok=True)
+        open(os.path.join(zone, "agent.env"), "w").write("AGENT_ID=exec9\n")
+        junk = os.path.join(zone, "tmp", "хлам")
+        os.makedirs(junk, exist_ok=True)
+        open(os.path.join(junk, "f"), "w").write("x")
+        age(junk, 400)
+        rs = [r[0] for r in m.roots()]
+        check("\U0001f534 корни зоны попали в обход",
+              os.path.join(zone, "tmp") in rs, rs)
+        con14 = m.db()
+        m.scan(con14)
+        row = con14.execute("SELECT uuid, state FROM resources WHERE path=? AND live=1",
+                            (junk,)).fetchone()
+        check("\U0001f534 мусор в зоне замечен", row is not None,
+              "зона отсекалась целиком — её мусор не убирался никогда")
+
+        print("")
+        print("20. Карантин зоны лежит внутри зоны, а не на чужой файловой системе")
+        qr = m.quarantine_root(junk)
+        check("\U0001f534 карантин зоны внутри зоны", qr.startswith(zone), qr)
+        check("карантин остального — общий",
+              m.quarantine_root("/tmp/что-то") == m.QUARANTINE)
+
+        print("")
+        print("21. Ресурс зоны арендуется как зона, а не выдуманным именем")
+        c1 = m.Claim("uid-1", junk)
+        check("\U0001f534 для пути в зоне арендуется zone:exec9",
+              c1.res == "zone:exec9", c1.res)
+        c2 = m.Claim("uid-2", os.path.join(sandbox, "work", "чужое"))
+        check("для копии — worktree:<uuid>", c2.res == "worktree:uid-2", c2.res)
+
+        print("")
+        print("22. Восстановление: оба пути существуют — не выбираем молча")
+        con15 = m.db()
+        wt6 = make_repo(sandbox, "оба")
+        m.scan(con15)
+        u6 = con15.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                           (wt6,)).fetchone()[0]
+        ip = m.qpath_for(u6, wt6)
+        os.makedirs(ip, exist_ok=True)
+        m.to_state(con15, u6, "QUARANTINING", "имитация", intended_path=ip)
+        fixed = m.recover(con15)
+        st = con15.execute("SELECT state, reason FROM resources WHERE uuid=?",
+                           (u6,)).fetchone()
+        check("\U0001f534 остаётся в QUARANTINING для разбора", st[0] == "QUARANTINING", st)
+        check("причина названа", "оба пути" in (st[1] or ""), st)
+        shutil.rmtree(ip, ignore_errors=True)
+
+        print("")
+        print("23. Восстановление: карантин недоступен — решение откладывается")
+        con16 = m.db()
+        saved_q = m.QUARANTINE
+        m.QUARANTINE = os.path.join(sandbox, "нет-карантина")
+        m.to_state(con16, u6, "QUARANTINING", "имитация",
+                   intended_path=os.path.join(m.QUARANTINE, u6))
+        fixed = m.recover(con16)
+        st = con16.execute("SELECT state FROM resources WHERE uuid=?", (u6,)).fetchone()
+        check("\U0001f534 состояние не изменено при недоступном карантине",
+              st[0] == "QUARANTINING", st)
+        check("решение названо отложенным",
+              any("отложено" in f[2] for f in fixed), fixed)
+        m.QUARANTINE = saved_q
+
+        print("")
+        print("24. Ссылка живёт, пока ресурс не удалён на самом деле")
+        con17 = m.db()
+        uid_live = con17.execute("SELECT uuid FROM resources WHERE state!='DELETED' "
+                                 "AND live=1 LIMIT 1").fetchone()[0]
+        con17.execute("INSERT OR REPLACE INTO rescue VALUES(?,?,?,?)",
+                      ("refs/rescue/gc/живой/1", uid_live, "0" * 40,
+                       int(time.time()) - 40 * 86400))
+        con17.commit()
+        gone = m.rescue_cleanup(con17, True)
+        check("\U0001f534 ссылка не удалена, пока копия не удалена",
+              not any("живой" in str(g[1]) for g in gone), gone)
+
+        print("")
+        print("25. Несовместимая старая база отводится в сторону, а не ломает работу")
+        old_db_path = os.path.join(m.ROOT, "старая.db")
+        import sqlite3 as _s
+        c = _s.connect(old_db_path)
+        c.execute("CREATE TABLE resources(path TEXT PRIMARY KEY, kind TEXT)")
+        c.commit(); c.close()
+        saved_db = m.DB
+        m.DB = old_db_path
+        con18 = m.db()
+        cols = {r[1] for r in con18.execute("PRAGMA table_info(resources)")}
+        check("\U0001f534 новая база создана с нужными колонками",
+              {"uuid", "live", "generation"} <= cols, cols)
+        aside = [f for f in os.listdir(m.ROOT) if f.startswith("старая.db.old-")]
+        check("старая база сохранена рядом", bool(aside), os.listdir(m.ROOT))
+        m.DB = saved_db
+
+        print(f"\nИТОГ: {N[1]} из {N[0]}")
+        return 0 if N[1] == N[0] else 1
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
