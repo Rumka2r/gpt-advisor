@@ -495,9 +495,12 @@ def hold_add(con, d):
     # запрет обходится установкой собственного удержания с коротким сроком.
     prev = con.execute("SELECT approved_by FROM holds WHERE resource=?", (r,)).fetchone()
     if prev and prev[0] and not d.get("_admin"):
-        return {"ok": False, "причина": "удержание поставлено Мостом — менять может только он"}
-    # 🔴 Удержание отзывает конфликтующие аренды и поднимает поколение: иначе тот,
-    # кто уже держит ресурс, продолжит работу как ни в чём не бывало.
+        return {"ok": False,
+                "причина": "удержание поставлено Мостом — менять может только он"}
+    # 🔴 Одной транзакцией: база открыта с автофиксацией каждого выражения, и без
+    # BEGIN IMMEDIATE между отзывом аренд и записью удержания есть окно, в котором
+    # ресурс уже никем не арендован, но и не удержан — его успевают захватить.
+    con.execute("BEGIN IMMEDIATE")
     revoked = []
     for res, agent in con.execute("SELECT resource, agent_id FROM leases").fetchall():
         if conflicts_with(r, res):
@@ -516,6 +519,7 @@ def hold_add(con, d):
     log(con, d.get("agent_id"), None, "hold_set",
         {"resource": r, "причина": d.get("reason", ""), "до": exp,
          "отозвано_аренд": len(revoked)})
+    con.execute("COMMIT")
     return {"ok": True, "resource": r, "отозванные_аренды": revoked}
 
 

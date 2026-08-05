@@ -702,6 +702,64 @@ def main():
                  "refs/rescue").stdout
         check("в личном репозитории спасательных ссылок нет", not own.strip(), own[:80])
 
+        print("")
+        print("34. Точечный запуск не трогает соседние ресурсы")
+        con26 = m.db()
+        a1p = os.path.join(sandbox, "tmp", "цель")
+        b1p = os.path.join(sandbox, "tmp", "сосед")
+        for d in (a1p, b1p):
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "f"), "w").write("x")
+            age(d, 400)
+        m.scan(con26)
+        ua = con26.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                           (a1p,)).fetchone()[0]
+        ub = con26.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                           (b1p,)).fetchone()[0]
+        for u in (ua, ub):
+            m.to_state(con26, u, "EXPIRED", "просрочен")
+            backdate(m, con26, u, 100)
+        m.advance(con26, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2),
+                  {"only_uuid": {ua}, "scope": "all"})
+        sa = con26.execute("SELECT state FROM resources WHERE uuid=?", (ua,)).fetchone()
+        sb = con26.execute("SELECT state FROM resources WHERE uuid=?", (ub,)).fetchone()
+        check("🔴 указанный ресурс обработан", sa[0] == "QUARANTINED", sa)
+        check("🔴 соседний НЕ тронут", sb[0] == "EXPIRED", sb)
+        check("соседний файл на месте", os.path.exists(b1p))
+
+        print("")
+        print("35. Область zones не трогает рабочие копии")
+        con27 = m.db()
+        wt9 = make_repo(sandbox, "вне-области")
+        age(wt9, 400)
+        m.scan(con27)
+        u10 = con27.execute("SELECT uuid FROM resources WHERE path=? AND live=1",
+                            (wt9,)).fetchone()[0]
+        m.to_state(con27, u10, "EXPIRED", "просрочена")
+        backdate(m, con27, u10, 100)
+        m.advance(con27, m.disk_state(), True, dict(roots_ok=True, failed=[], read=2),
+                  {"scope": "zones"})
+        st = con27.execute("SELECT state FROM resources WHERE uuid=?", (u10,)).fetchone()
+        check("🔴 при области zones копия не тронута", st[0] == "EXPIRED", st)
+        check("копия на месте", os.path.exists(wt9))
+
+        print("")
+        print("36. Чистку ссылок можно отключить на время canary")
+        con28 = m.db()
+        out = m.rescue_cleanup(con28, True, {"skip_rescue": True})
+        check("🔴 чистка ссылок пропущена",
+              any("отключена" in str(x[2]) for x in out), out)
+
+        print("")
+        print("37. Недоступный реестр зон запрещает работу")
+        m.ZONES_FILE = os.path.join(m.ROOT, "нет-реестра.txt")
+        zs, ok3 = m.expected_zones()
+        check("🔴 отсутствие реестра — не «зон нет»", ok3 is False, ok3)
+        rs, ok4 = m.roots()
+        check("обход при этом неполон", ok4 is False, ok4)
+        open(os.path.join(m.ROOT, "zones.txt"), "w").write("")
+        m.ZONES_FILE = os.path.join(m.ROOT, "zones.txt")
+
         print(f"\nИТОГ: {N[1]} из {N[0]}")
         return 0 if N[1] == N[0] else 1
     finally:

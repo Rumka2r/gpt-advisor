@@ -427,7 +427,11 @@ def expected_zones():
 
     🔴 Иначе отвал тома зоны выглядит как «зоны больше нет»: точка монтирования
     остаётся, а `agent.env` вместе с содержимым исчезает, и обход считает себя
-    полным. Реестр ведёт провижининг, сборщик его только читает."""
+    полным. Реестр ведёт провижининг, сборщик его только читает.
+
+    🔴 Файл обязателен. Его отсутствие или нечитаемость — НЕ «зон нет», а
+    неизвестное состояние: возвращаем (список, False), и это запрещает apply.
+    """
     out = []
     try:
         with open(ZONES_FILE, encoding="utf-8") as f:
@@ -435,9 +439,10 @@ def expected_zones():
                 line = line.split("#", 1)[0].strip()
                 if line:
                     out.append(line)
-    except OSError:
-        pass
-    return out
+    except OSError as e:
+        print(f"🔴 реестр зон недоступен ({e}) — состояние неизвестно")
+        return out, False
+    return out, True
 
 
 def zone_ok(zone):
@@ -469,7 +474,10 @@ def roots():
     ok = True
     # Сначала — ожидаемые зоны из реестра: их отсутствие означает поломку,
     # а не «зоны больше нет».
-    for zone in expected_zones():
+    zones, registry_ok = expected_zones()
+    if not registry_ok:
+        ok = False
+    for zone in zones:
         good, why = zone_ok(zone)
         if not good:
             print(f"🔴 ожидаемая зона {zone} не в порядке: {why}")
@@ -1009,7 +1017,25 @@ def recover(con):
     return fixed
 
 
-def advance(con, disk, apply_, scan_res):
+def in_scope(uid, path, kind, sel):
+    """Попадает ли ресурс под ограничения запуска.
+
+    🔴 Без этого «сначала только зоны» технически невозможно: один ручной
+    запуск ради двух пробных ресурсов перенёс бы и удалил всё созревшее.
+    """
+    if sel.get("only_uuid") and uid not in sel["only_uuid"]:
+        return False
+    scope = sel.get("scope", "all")
+    in_zone = path.startswith(AGENTS_DIR + os.sep)
+    if scope == "zones":
+        return in_zone and kind != "worktree"
+    if scope == "worktrees":
+        return kind == "worktree"
+    return True
+
+
+def advance(con, disk, apply_, scan_res, sel=None):
+    sel = sel or {}
     acted = []
     holds, holds_ok = holds_now()
     if apply_ and not holds_ok:
@@ -1023,6 +1049,8 @@ def advance(con, disk, apply_, scan_res):
     for uid, path, kind, since, size in con.execute(
             "SELECT uuid, path, kind, state_since, size FROM resources "
             "WHERE state='EXPIRED' AND live=1").fetchall():
+        if not in_scope(uid, path, kind, sel):
+            continue
         pol = KINDS[kind]
         need = max(pol["grace_h"] * speed, pol["min_h"]) * 3600
         if now() - since < need:
@@ -1084,6 +1112,8 @@ def advance(con, disk, apply_, scan_res):
     for uid, path, kind, since, size, qp in con.execute(
             "SELECT uuid, path, kind, state_since, size, quarantine_path FROM resources "
             "WHERE state='QUARANTINED' AND live=1").fetchall():
+        if not in_scope(uid, path, kind, sel):
+            continue
         pol = KINDS[kind]
         need = max(pol["purge_h"] * speed, pol["min_h"]) * 3600
         if now() - since < need:
@@ -1160,7 +1190,10 @@ def rescue_reconcile(con):
     return orphans
 
 
-def rescue_cleanup(con, apply_):
+def rescue_cleanup(con, apply_, sel=None):
+    sel = sel or {}
+    if sel.get("skip_rescue"):
+        return [("пропущено", "refs/rescue", "чистка ссылок отключена флагом", 0)]
     """Спасательные ссылки живут 30 дней ОТ ДАТЫ СПАСЕНИЯ (она в базе: у git
     даты создания ссылки нет, а дата коммита к спасению отношения не имеет)."""
     holds, holds_ok = holds_now()
@@ -1171,6 +1204,8 @@ def rescue_cleanup(con, apply_):
     for ref, res_uuid, at in con.execute(
             "SELECT ref, res_uuid, rescued_at FROM rescue "
             "WHERE rescued_at > 0 AND rescued_at < ?", (limit,)).fetchall():
+        if sel.get("only_uuid") and res_uuid not in sel["only_uuid"]:
+            continue
         if res_uuid in holds or ref in holds:
             continue
         # 🔴 Ссылка — последняя копия работы. Удалять её можно, только когда сам
@@ -1240,7 +1275,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["scan", "run", "report", "disk", "recover"])
     ap.add_argument("--apply", action="store_true", help="реально выполнять переходы")
+    ap.add_argument("--only-uuid", action="append", default=[],
+                    help="только эти ресурсы (можно повторять) — для canary")
+    ap.add_argument("--scope", choices=["zones", "worktrees", "all"], default="all",
+                    help="zones = только tmp/cache зон исполнителей")
+    ap.add_argument("--skip-rescue-cleanup", action="store_true",
+                    help="не трогать спасательные ссылки в этом запуске")
     a = ap.parse_args()
+    sel = {"only_uuid": set(a.only_uuid), "scope": a.scope,
+           "skip_rescue": a.skip_rescue_cleanup}
 
     d = disk_state()
     write_disk_state(d)
@@ -1270,8 +1313,12 @@ def main():
                       f"автоматически НЕ удаляются, разобрать вручную")
                 for r in orphans[:5]:
                     print("   ", r)
-            acted = advance(con, d, a.apply, scan_res)
-            acted += rescue_cleanup(con, a.apply)
+            if a.apply and (sel["only_uuid"] or a.scope != "all"):
+                print(f"область: scope={a.scope}"
+                      + (f", только {len(sel['only_uuid'])} ресурсов"
+                         if sel["only_uuid"] else ""))
+            acted = advance(con, d, a.apply, scan_res, sel)
+            acted += rescue_cleanup(con, a.apply, sel)
             # честно: показ обновляет учёт и состояние диска, но ничего
             # не переносит и не удаляет
             head = ("СДЕЛАНО" if a.apply else
