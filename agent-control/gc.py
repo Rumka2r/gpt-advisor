@@ -442,6 +442,11 @@ def expected_zones():
     except OSError as e:
         print(f"🔴 реестр зон недоступен ({e}) — состояние неизвестно")
         return out, False
+    if not out:
+        # 🔴 Пустой реестр — не «зон нет», а не заполненная настройка. Считать
+        # его нормой значит разрешить работу там, где состав зон неизвестен.
+        print("🔴 реестр зон пуст — состав зон неизвестен")
+        return out, False
     return out, True
 
 
@@ -477,6 +482,7 @@ def roots():
     zones, registry_ok = expected_zones()
     if not registry_ok:
         ok = False
+    known = {z.rstrip("/") for z in zones}
     for zone in zones:
         good, why = zone_ok(zone)
         if not good:
@@ -493,6 +499,11 @@ def roots():
         try:
             if not os.path.exists(os.path.join(zone, "agent.env")):
                 continue
+            # 🔴 Зона на диске есть, а в реестре её нет — это ошибка настройки,
+            # а не «ещё одна зона». Работать при неизвестном составе нельзя.
+            if zone.rstrip("/") not in known:
+                print(f"🔴 зона {zone} не значится в реестре")
+                ok = False
             for sub in ("tmp", "cache"):
                 p = os.path.join(zone, sub)
                 if os.path.isdir(p):
@@ -967,13 +978,19 @@ def do_purge(con, uid, kind, qpath):
     return True, ""
 
 
-def recover(con):
+def recover(con, sel=None):
+    """При точечном запуске разбирает ТОЛЬКО указанные ресурсы: иначе ручная
+    команда ради одного canary-каталога чинила бы состояния всех остальных."""
+    sel = sel or {}
+    only = sel.get("only_uuid") or None
     """Разобрать зависшие переходы после падения: файловая система и база могли
     разойтись ровно между фиксацией намерения и действием."""
     fixed = []
     for uid, path, kind, ip, qp in con.execute(
             "SELECT uuid, path, kind, intended_path, quarantine_path FROM resources "
             "WHERE state='QUARANTINING'").fetchall():
+        if only and uid not in only:
+            continue
         # 🔴 Недоступный карантин НЕ значит «перенесено и удалено». Пока корень
         # карантина не читается, решение не принимаем вообще.
         qroot = os.path.dirname(ip) if ip else quarantine_root(path)
@@ -1003,6 +1020,8 @@ def recover(con):
     for uid, path, kind, qp in con.execute(
             "SELECT uuid, path, kind, quarantine_path FROM resources "
             "WHERE state='PURGEABLE'").fetchall():
+        if only and uid not in only:
+            continue
         qroot = os.path.dirname(qp) if qp else quarantine_root(path)
         if not os.path.isdir(qroot):
             fixed.append((uid, path, "🔴 карантин недоступен — решение отложено"))
@@ -1293,7 +1312,7 @@ def main():
 
     with Lock():
         con = db()
-        fixed = recover(con)
+        fixed = recover(con, sel)
         if fixed:
             print(f"восстановлено зависших переходов: {len(fixed)}")
             for uid, path, what in fixed:
