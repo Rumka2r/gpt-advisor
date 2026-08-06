@@ -195,6 +195,7 @@ def init():
     os.makedirs(ROOT, exist_ok=True)
     con = db()
     con.executescript(SCHEMA)
+    products.migrate(con)
     con.close()
     if not os.path.exists(KEYFILE):
         with open(KEYFILE, "w") as f:

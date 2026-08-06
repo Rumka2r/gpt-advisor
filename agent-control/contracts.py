@@ -183,9 +183,11 @@ def validate(body, canon_resource=None):
                 continue
             # 🔴 Обязательный результат без единой проверки бессмыслен: реестр
             # примет что угодно и сочтёт задачу выполненной.
-            if o["required"] and not names:
-                errs.append(f"выход {slot}: у обязательного результата должна быть "
-                            f"хотя бы одна проверка, например digest_verified")
+            # 🔴 У обязательного результата сверка отпечатка обязана быть в
+            # списке: без неё «подтверждено» означало бы лишь то, что кто-то
+            # нажал кнопку. Добавляем сами, если автор её не указал.
+            if o["required"] and "digest_verified" not in names:
+                names = ["digest_verified"] + names
             o["checks"] = names
         if len(set(slots)) != len(slots):
             errs.append("слоты выходов повторяются")

@@ -385,11 +385,17 @@ check("лишнее поле контракта отклонено", not r.get("
 
 print("")
 print("23. Обязательный результат без проверок не принимается")
-bad3 = dict(contract_for("exec1", ["branch:x"]))
+# 🔴 Пустой список проверок у обязательного результата дополняется сверкой
+# отпечатка: подтвердить результат без неё нельзя в принципе.
+t23 = "T-nocheck-" + RUN
+bad3 = dict(contract_for("exec1", ["branch:" + uuid.uuid4().hex[:8]]))
 bad3["outputs"] = [{"slot": "impl", "kind": "report", "required": True, "checks": []}]
-r = call("/task", task_id="T-nocheck-" + RUN, title="без проверок", agent_id="exec1",
-         contract=bad3)
-check("🔴 обязательный результат без проверок отклонён", not r.get("ok"), r)
+r = call("/task", task_id=t23, title="без проверок", agent_id="exec1", contract=bad3)
+check("контракт принят", r.get("ok"), r)
+c23 = call("/contract", task_id=t23)
+check("🔴 сверка отпечатка добавлена сама",
+      c23.get("контракт", {}).get("outputs", [{}])[0].get("checks")
+      == ["digest_verified"], c23.get("контракт"))
 
 print("")
 print("24. Имена слотов и проверок нормализуются")

@@ -23,6 +23,7 @@
 
 import hashlib
 import json
+import re
 import time
 import uuid as uuidlib
 
@@ -30,6 +31,35 @@ import product_policy
 
 STATES = ("candidate", "verified", "rejected", "superseded")
 IMMUTABLE = ("git", "object_storage")
+
+# 🔴 Псевдонимы хранилищ ведёт СЕРВЕР. Произвольный путь или имя корзины от
+# клиента означали бы, что «доказательство» указывает куда угодно.
+GIT_REPOSITORIES = {
+    "agent-store": "/srv/agents/store.git",
+}
+OBJECT_STORES = {
+    "agent-archive": {"bucket": "plumbingcore-prod-immutable-backups",
+                      "prefix": "agent-history/"},
+}
+
+# Какой вид результата в каком хранилище допустим.
+KIND_LOCATORS = {
+    "git_commit": ("git",),
+    "git_ref": ("git",),
+    "object": ("git", "object_storage", "path"),
+    "report": ("git", "object_storage", "path"),
+    "dataset": ("git", "object_storage", "path"),
+    "config": ("git", "object_storage", "path"),
+}
+
+# Отпечаток: для git это сам идентификатор объекта, для хранилища — SHA-256.
+DIGEST_ALGS = {"git": "git_sha1", "object_storage": "sha256"}
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+# 🔴 Проверка, без которой подтверждение бессмысленно: она доказывает, что
+# результат действительно существует и совпадает с заявленным отпечатком.
+DIGEST_CHECK = "digest_verified"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work_products(
@@ -40,9 +70,12 @@ CREATE TABLE IF NOT EXISTS work_products(
     digest_alg TEXT NOT NULL, digest TEXT NOT NULL, size INTEGER,
     producer_agent TEXT NOT NULL, producer_instance TEXT NOT NULL,
     fencing TEXT NOT NULL, state TEXT NOT NULL, supersedes TEXT,
-    idempotency_key TEXT NOT NULL, metadata TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL, request_sha256 TEXT NOT NULL,
+    metadata TEXT NOT NULL,
     created_at INTEGER NOT NULL, registered_at INTEGER NOT NULL,
-    UNIQUE(producer_agent, idempotency_key));
+    -- 🔴 Ключ повтора действует В ПРЕДЕЛАХ ЗАДАЧИ: иначе тот же ключ в другой
+    -- задаче возвращал бы чужой продукт с признаком успеха.
+    UNIQUE(task_id, producer_agent, idempotency_key));
 
 -- 🔴 В одном слоте одной версии контракта живой продукт ровно один: иначе
 -- «какой результат считается итогом» становится вопросом без ответа.
@@ -58,6 +91,37 @@ CREATE TABLE IF NOT EXISTS product_checks(
     checked_at INTEGER NOT NULL,
     UNIQUE(product_id, check_name, attempt));
 """
+
+
+def migrate(con):
+    """Привести таблицу продуктов к текущей схеме.
+
+    🔴 `CREATE TABLE IF NOT EXISTS` существующую таблицу НЕ меняет: после
+    добавления полей и ограничений старая база молча оставалась бы прежней, и
+    регистрация падала бы «нет такого столбца». Перестраиваем с переносом
+    записей — терять уже зарегистрированные продукты нельзя.
+    """
+    cols = {r[1] for r in con.execute("PRAGMA table_info(work_products)")}
+    if not cols or "request_sha256" in cols:
+        return False
+    con.executescript("""
+        PRAGMA foreign_keys=OFF;
+        BEGIN IMMEDIATE;
+        ALTER TABLE work_products RENAME TO work_products_old;
+        DROP INDEX IF EXISTS wp_current_slot;
+    """)
+    con.executescript(SCHEMA)
+    old_cols = [c for c in cols if c != "request_sha256"]
+    names = ", ".join(old_cols)
+    con.execute(f"INSERT INTO work_products ({names}, request_sha256) "
+                f"SELECT {names}, '' FROM work_products_old")
+    con.executescript("""
+        DROP TABLE work_products_old;
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+    """)
+    print("таблица продуктов перестроена под новую схему, записи сохранены")
+    return True
 
 
 def now():
@@ -76,28 +140,35 @@ def check_locator(kind, loc):
         return "locator должен быть объектом", None, None
     t = loc.get("type")
     if t not in ("git", "object_storage", "path"):
-        return f"locator.type должен быть git, object_storage или path", None, None
+        return "locator.type должен быть git, object_storage или path", None, None
+    allowed = KIND_LOCATORS.get(kind)
+    if not allowed:
+        return f"неизвестный вид результата {kind!r}", None, None
+    if t not in allowed:
+        # 🔴 Раньше git_ref можно было зарегистрировать в объектном хранилище:
+        # вид и адрес не сверялись вовсе.
+        return (f"вид {kind} не может лежать в {t}; допустимо: "
+                f"{', '.join(allowed)}"), None, None
 
     if t == "git":
         repo = loc.get("repository")
-        if not isinstance(repo, str) or not repo.strip():
-            return ("для git обязателен repository — серверный псевдоним хранилища, "
-                    "а не произвольный путь клиента"), None, None
+        if repo not in GIT_REPOSITORIES:
+            return (f"репозиторий {repo!r} не значится в серверном каталоге; "
+                    f"допустимые: {', '.join(sorted(GIT_REPOSITORIES))}"), None, None
         if kind == "git_ref":
-            # 🔴 Ссылка изменяема сама по себе: сегодня она указывает на один
-            # коммит, завтра на другой. Поэтому личностью продукта считается
-            # ЗАФИКСИРОВАННЫЙ коммит, а ссылка — только адрес.
+            # Ссылка изменяема: сегодня указывает на один коммит, завтра на
+            # другой. Личность продукта — зафиксированный коммит, ссылка — адрес.
             if not loc.get("ref"):
                 return "для git_ref обязателен ref", None, None
-            tgt = loc.get("target_commit")
-            if not isinstance(tgt, str) or len(tgt) != 40:
+            tgt = str(loc.get("target_commit", "")).lower()
+            if not HEX40.match(tgt):
                 return ("для git_ref обязателен target_commit — полный "
                         "идентификатор коммита"), None, None
             canon = {"type": "git", "repository": repo, "ref": loc["ref"],
                      "target_commit": tgt}
         else:
-            c = loc.get("commit")
-            if not isinstance(c, str) or len(c) != 40:
+            c = str(loc.get("commit", "")).lower()
+            if not HEX40.match(c):
                 return "для git обязателен полный commit (40 знаков)", None, None
             canon = {"type": "git", "repository": repo, "commit": c}
             if loc.get("path"):
@@ -105,18 +176,43 @@ def check_locator(kind, loc):
         return None, t, canon
 
     if t == "object_storage":
-        for f in ("bucket", "key", "version_id"):
+        alias = loc.get("bucket")
+        if alias not in OBJECT_STORES:
+            return (f"хранилище {alias!r} не значится в серверном каталоге; "
+                    f"допустимые: {', '.join(sorted(OBJECT_STORES))}"), None, None
+        for f in ("key", "version_id"):
             if not isinstance(loc.get(f), str) or not loc[f].strip():
                 return (f"для object_storage обязателен {f}"
                         + (" — без версии объект изменяем" if f == "version_id" else ""),
                         None, None)
-        return None, t, {"type": t, "bucket": loc["bucket"], "key": loc["key"],
+        return None, t, {"type": t, "bucket": alias, "key": loc["key"],
                          "version_id": loc["version_id"]}
 
-    p = loc.get("path")
-    if not isinstance(p, str) or not p.strip():
+    pth = loc.get("path")
+    if not isinstance(pth, str) or not pth.strip():
         return "для path обязателен path", None, None
-    return None, t, {"type": "path", "path": p}
+    return None, t, {"type": "path", "path": pth}
+
+
+def check_digest(ltype, alg, digest, loc):
+    """Отпечаток по правилам своего хранилища."""
+    want_alg = DIGEST_ALGS.get(ltype)
+    if want_alg is None:
+        return None            # обычный путь: отпечаток не обязателен
+    if alg != want_alg:
+        return f"для {ltype} digest_alg должен быть {want_alg}, прислан {alg!r}"
+    d = str(digest or "").lower()
+    if ltype == "git":
+        if not HEX40.match(d):
+            return "для git отпечаток — идентификатор объекта (40 знаков)"
+        # 🔴 Отпечаток обязан совпадать с адресом: иначе продукт «доказывает»
+        # один объект, а лежит по другому.
+        own = loc.get("target_commit") or loc.get("commit")
+        if not loc.get("path") and d != own:
+            return "отпечаток не совпадает с коммитом в адресе"
+    elif not HEX64.match(d):
+        return "для объектного хранилища отпечаток — SHA-256 (64 знака)"
+    return None
 
 
 # ── Регистрация ─────────────────────────────────────────────────────────────
@@ -132,14 +228,27 @@ def register(con, d, contracts_mod, canon_resource):
     if not task_id or not idem:
         return {"ok": False, "причина": "нужны task_id и idempotency_key"}
 
+    # Отпечаток запроса: по нему отличаем настоящий повтор от чужого содержимого
+    # под тем же ключом.
+    req_sha = hashlib.sha256(json.dumps(
+        {k: d.get(k) for k in ("task_id", "output_slot", "kind", "locator",
+                               "digest", "digest_alg", "size", "supersedes")},
+        ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
     con.execute("BEGIN IMMEDIATE")
     try:
         # Повтор с тем же ключом возвращает уже созданный продукт, а не дубль.
-        row = con.execute("SELECT product_id, state FROM work_products "
-                          "WHERE producer_agent=? AND idempotency_key=?",
-                          (agent, idem)).fetchone()
+        row = con.execute("SELECT product_id, state, request_sha256 FROM work_products "
+                          "WHERE task_id=? AND producer_agent=? AND idempotency_key=?",
+                          (task_id, agent, idem)).fetchone()
         if row:
             con.execute("ROLLBACK")
+            # 🔴 Повтор — это ТОТ ЖЕ запрос. Тот же ключ с другим слотом, адресом
+            # или отпечатком — не повтор, а ошибка вызывающего.
+            if row[2] != req_sha:
+                return {"ok": False,
+                        "причина": "тот же ключ повтора с другим содержимым запроса",
+                        "product_id": row[0]}
             return {"ok": True, "product_id": row[0], "состояние": row[1],
                     "повтор": True}
 
@@ -183,14 +292,29 @@ def register(con, d, contracts_mod, canon_resource):
         # 🔴 Аренда проверяется ПРЯМО ЗДЕСЬ, а не отдельным запросом: между
         # ответом «право есть» и вставкой было бы окно, в котором право
         # отбирают удержанием или блокировкой задачи.
-        leases = con.execute("SELECT resource, lease_token, instance_id, fencing_token "
-                             "FROM leases WHERE task_id=? AND agent_id=?",
-                             (task_id, agent)).fetchall()
+        # 🔴 Срок аренды читаем ЗДЕСЬ, а не полагаемся на фонового уборщика:
+        # между истечением и его проходом есть окно, в котором протухший секрет
+        # проходил бы как действующий.
+        t_now = now()
+        leases = con.execute("SELECT resource, lease_token, instance_id, "
+                             "fencing_token, expires FROM leases "
+                             "WHERE task_id=? AND agent_id=? AND expires > ?",
+                             (task_id, agent, t_now)).fetchall()
         if not leases:
             con.execute("ROLLBACK")
             return {"ok": False,
                     "причина": "нет действующей аренды задачи — результат "
                                "регистрирует только тот, кто прямо сейчас работает"}
+        # 🔴 Набор аренд обязан покрывать ВСЕ ресурсы контракта: удержание могло
+        # отобрать одну из них, а по остатку регистрация проходила бы как ни в
+        # чём не бывало.
+        have = sorted({l[0] for l in leases})
+        want = sorted(set(body.get("resources", [])))
+        if have != want:
+            con.execute("ROLLBACK")
+            return {"ok": False,
+                    "причина": "аренда покрывает не все ресурсы контракта",
+                    "есть": have, "нужно": want}
         token = d.get("lease_token")
         inst = d.get("instance_id")
         if any(l[1] != token for l in leases):
@@ -200,8 +324,20 @@ def register(con, d, contracts_mod, canon_resource):
             con.execute("ROLLBACK")
             return {"ok": False, "причина": "аренда принадлежит другому процессу"}
         fencing = {l[0]: l[3] for l in leases}
-        want_f = d.get("fencing") or {}
-        if want_f and {k: int(v) for k, v in want_f.items()} != fencing:
+        want_f = d.get("fencing")
+        # 🔴 Поколение обязательно: раньше отсутствие поля просто пропускало
+        # сравнение, и устаревшая аренда проходила молча.
+        if not isinstance(want_f, dict) or not want_f:
+            con.execute("ROLLBACK")
+            return {"ok": False,
+                    "причина": "нужно прислать поколения аренды по всем ресурсам",
+                    "текущее": fencing}
+        try:
+            given = {k: int(v) for k, v in want_f.items()}
+        except (TypeError, ValueError):
+            con.execute("ROLLBACK")
+            return {"ok": False, "причина": "поколения должны быть числами"}
+        if given != fencing:
             con.execute("ROLLBACK")
             return {"ok": False, "причина": "поколение аренды устарело",
                     "текущее": fencing}
@@ -211,12 +347,13 @@ def register(con, d, contracts_mod, canon_resource):
             con.execute("ROLLBACK")
             return {"ok": False, "причина": err}
 
-        digest = d.get("digest")
-        alg = d.get("digest_alg", "sha256")
-        if ltype in IMMUTABLE and (not isinstance(digest, str) or not digest.strip()):
-            con.execute("ROLLBACK")
-            return {"ok": False,
-                    "причина": "для неизменяемого результата обязателен отпечаток"}
+        digest = str(d.get("digest") or "").lower()
+        alg = d.get("digest_alg") or DIGEST_ALGS.get(ltype, "")
+        if ltype in IMMUTABLE:
+            err = check_digest(ltype, alg, digest, loc)
+            if err:
+                con.execute("ROLLBACK")
+                return {"ok": False, "причина": err}
 
         sup = d.get("supersedes")
         cur = con.execute("SELECT product_id FROM work_products WHERE task_id=? AND "
@@ -238,12 +375,13 @@ def register(con, d, contracts_mod, canon_resource):
                         (sup,))
 
         pid = new_id("wp")
-        con.execute("INSERT INTO work_products VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO work_products "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (pid, task_id, ver, sha, slot, d.get("kind"), ltype,
                      json.dumps(loc, ensure_ascii=False, sort_keys=True),
                      alg, digest or "", d.get("size"), agent, inst or "",
                      json.dumps(fencing, sort_keys=True), "candidate", sup, idem,
-                     json.dumps(d.get("metadata", {}), ensure_ascii=False),
+                     req_sha, json.dumps(d.get("metadata", {}), ensure_ascii=False),
                      int(d.get("created_at") or now()), now()))
         con.execute("COMMIT")
         return {"ok": True, "product_id": pid, "состояние": "candidate",
@@ -287,7 +425,8 @@ def record_check(con, d, contracts_mod, system=False):
                                "проверять нечего"}
         out = next((o for o in act[1].get("outputs", []) if o.get("slot") == slot), None)
         required = list(out.get("checks", [])) if out else []
-        if name not in required:
+        # digest_verified требуется всегда, даже если контракт её не перечислил
+        if name not in required and name != DIGEST_CHECK:
             con.execute("ROLLBACK")
             return {"ok": False,
                     "причина": f"контракт не требует проверки {name!r} для слота "
@@ -316,30 +455,40 @@ def record_check(con, d, contracts_mod, system=False):
                      now()))
 
         verified, why2 = _verify(con, pid, required, ltype, digest, state)
-        if verified:
-            con.execute("UPDATE work_products SET state='verified' WHERE product_id=?",
-                        (pid,))
+        new_state = "verified" if verified else (
+            "candidate" if state in ("candidate", "verified") else state)
+        if new_state != state:
+            con.execute("UPDATE work_products SET state=? WHERE product_id=?",
+                        (new_state, pid))
         con.execute("COMMIT")
-        return {"ok": True, "попытка": attempt, "состояние_продукта":
-                ("verified" if verified else state), "почему": why2}
+        return {"ok": True, "попытка": attempt, "состояние_продукта": new_state,
+                "почему": why2}
     except Exception as e:
         con.execute("ROLLBACK")
         return {"ok": False, "причина": f"сбой: {e}"}
 
 
 def _verify(con, pid, required, ltype, digest, state):
-    """Проверен ли продукт: последняя попытка КАЖДОЙ обязательной проверки должна
-    быть успешной, адрес — неизменяемым, отпечаток — на месте."""
-    if state != "candidate":
+    """Подтверждён ли продукт.
+
+    🔴 Считается ПО ПОСЛЕДНИМ попыткам, и результат применяется в обе стороны:
+    поздняя неудача снимает подтверждение обратно в кандидаты. Иначе продукт,
+    у которого последний прогон провалился, оставался бы «проверенным».
+    """
+    if state in ("superseded", "rejected"):
         return False, f"продукт в состоянии {state}"
     if ltype not in IMMUTABLE:
-        # 🔴 Путь на диске не может закрыть обязательный слот: содержимое по нему
+        # Путь на диске не может закрыть обязательный слот: содержимое по нему
         # завтра будет другим, и доказать происхождение нечем.
         return False, ("обычный путь остаётся кандидатом: подтвердить можно только "
                        "неизменяемый адрес")
     if not digest:
         return False, "нет отпечатка"
-    for name in required:
+    # 🔴 Сверка отпечатка обязательна ВСЕГДА, независимо от того, какие проверки
+    # перечислил автор контракта: без неё «подтверждено» означало бы лишь то,
+    # что кто-то нажал кнопку.
+    names = list(dict.fromkeys(list(required) + [DIGEST_CHECK]))
+    for name in names:
         row = con.execute("SELECT status FROM product_checks WHERE product_id=? AND "
                           "check_name=? ORDER BY attempt DESC LIMIT 1",
                           (pid, name)).fetchone()
@@ -347,7 +496,7 @@ def _verify(con, pid, required, ltype, digest, state):
             return False, f"проверка {name} ещё не выполнялась"
         if row[0] != "passed":
             return False, f"последняя попытка проверки {name}: {row[0]}"
-    return True, "все обязательные проверки пройдены"
+    return True, "все обязательные проверки пройдены, отпечаток сверен"
 
 
 def show(con, d):

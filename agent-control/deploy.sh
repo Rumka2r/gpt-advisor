@@ -25,8 +25,8 @@ case "$(realpath -m "$DST")" in
   "$RELEASES"/*) ;;
   *) echo "путь релиза вышел за пределы $RELEASES"; exit 1 ;;
 esac
-MODULES="cp.py contracts.py gc.py ctl.py safe_write.py"
-TESTS="test_cp.py test_gc.py"
+MODULES="cp.py contracts.py products.py product_policy.py verifier.py gc.py ctl.py safe_write.py health_check.py"
+TESTS="test_cp.py test_gc.py test_products.py"
 
 echo "=== развёртывание $TAG ==="
 mkdir -p "$RELEASES"
@@ -47,7 +47,7 @@ python3 -m py_compile $(for f in $MODULES $TESTS; do echo "$DST/$f"; done)
 echo "--- импорт модулей ---"
 ( cd "$DST" && python3 -c "
 import importlib.util, sys
-for name in ['cp', 'contracts', 'gc', 'safe_write']:
+for name in ['product_policy', 'contracts', 'products', 'gc', 'safe_write', 'cp', 'verifier']:
     spec = importlib.util.spec_from_file_location(name, name + '.py')
     m = importlib.util.module_from_spec(spec)
     sys.modules[name] = m

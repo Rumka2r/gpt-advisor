@@ -12,7 +12,13 @@ API = "http://127.0.0.1:8010"
 KEY = open("/opt/agent-control/api.key").read().strip()
 RUN = uuid.uuid4().hex[:6]
 N = [0, 0]
-COMMIT = "a" * 40
+# 🔴 Настоящий коммит из архива: без него системная сверка отпечатка провалится,
+# и проверить подтверждение было бы нечем. Поддельный используем отдельно.
+import subprocess
+COMMIT = subprocess.run(["git", "-C", "/srv/agents/store.git", "rev-parse",
+                         "refs/heads/main"], capture_output=True,
+                        text=True).stdout.strip() or "a" * 40
+FAKE = "f" * 40
 
 
 def call(path, key=KEY, **p):
@@ -65,8 +71,9 @@ def reg(ctx, **over):
     body = dict(task_id=ctx["task"], agent_id=ctx["agent"],
                 contract_version=ctx["version"], contract_sha256=ctx["sha"],
                 output_slot="impl", kind="git_commit",
-                locator={"type": "git", "repository": "agent-store", "commit": COMMIT},
-                digest="sha256:" + "b" * 64, lease_token=ctx["lease"],
+                locator={"type": "git", "repository": "agent-store",
+                         "commit": COMMIT},
+                digest=COMMIT, digest_alg="git_sha1", lease_token=ctx["lease"],
                 instance_id=ctx["inst"], fencing=ctx["fencing"],
                 idempotency_key=uuid.uuid4().hex)
     body.update(over)
@@ -78,7 +85,9 @@ c1 = prepare("ok")
 r = reg(c1)
 check("продукт зарегистрирован", r.get("ok"), r)
 check("состояние — кандидат", r.get("состояние") == "candidate", r)
-check("названы требуемые проверки", r.get("требуются_проверки") == ["tests"], r)
+# 🔴 Сверка отпечатка добавляется в контракт сама: без неё подтверждать нечего
+check("названы требуемые проверки",
+      r.get("требуются_проверки") == ["digest_verified", "tests"], r)
 pid = r.get("product_id")
 
 print("")
@@ -142,8 +151,9 @@ if r.get("ok"):
 
 print("")
 print("9. Обычный путь не становится подтверждённым")
-c9 = prepare("path")
-r = reg(c9, locator={"type": "path", "path": "/tmp/результат.txt"}, digest="")
+c9 = prepare("path", kind="report")
+r = reg(c9, kind="report", locator={"type": "path", "path": "/tmp/результат.txt"},
+        digest="", digest_alg="")
 check("путь принят как кандидат", r.get("ok"), r)
 check("помечен как изменяемый", r.get("неизменяемый") is False, r)
 if r.get("ok"):
@@ -187,11 +197,17 @@ check("неуспех записан", r.get("ok"), r)
 check("🔴 продукт НЕ подтверждён", r.get("состояние_продукта") != "verified", r)
 r = call("/product/check", agent_id="exec1", product_id=p12, check_name="tests",
          status="passed", evidence="после починки прошло")
-check("🔴 успешный повтор подтвердил продукт",
-      r.get("состояние_продукта") == "verified", r)
+check("🔴 без сверки отпечатка продукт НЕ подтверждён",
+      r.get("состояние_продукта") == "candidate", r)
+subprocess.run(["python3", "/opt/agent-control/verifier.py", "--product", p12],
+               capture_output=True, text=True)
+st12 = call("/product", product_id=p12)
+check("🔴 после сверки подтверждён",
+      st12.get("продукт", {}).get("state") == "verified", st12.get("продукт"))
 check("это вторая попытка, история сохранена", r.get("попытка") == 2, r)
 st = call("/product", product_id=p12)
-check("обе попытки в истории", len(st.get("проверки", [])) == 2, st.get("проверки"))
+tests_only = [c for c in st.get("проверки", []) if c["проверка"] == "tests"]
+check("обе попытки проверки в истории", len(tests_only) == 2, tests_only)
 
 print("")
 print("13. Подтверждение продукта задачу НЕ завершает")
@@ -215,19 +231,111 @@ print("")
 print("16. Ссылка git требует зафиксированного коммита")
 c16 = prepare("ref", kind="git_ref")
 r = reg(c16, kind="git_ref",
-        locator={"type": "git", "repository": "agent-store", "ref": "refs/tasks/x"})
+        locator={"type": "git", "repository": "agent-store", "ref": "refs/tasks/x"},
+        digest=COMMIT)
 check("🔴 ссылка без target_commit отклонена", not r.get("ok"), r)
 r = reg(c16, kind="git_ref",
         locator={"type": "git", "repository": "agent-store", "ref": "refs/tasks/x",
-                 "target_commit": COMMIT})
+                 "target_commit": COMMIT}, digest=COMMIT)
 check("ссылка с зафиксированным коммитом принята", r.get("ok"), r)
 
 print("")
 print("17. Объект хранилища требует версии")
 c17 = prepare("obj", kind="object")
 r = reg(c17, kind="object",
-        locator={"type": "object_storage", "bucket": "b", "key": "k"})
+        locator={"type": "object_storage", "bucket": "agent-archive", "key": "k"},
+        digest="d" * 64, digest_alg="sha256")
 check("🔴 объект без version_id отклонён", not r.get("ok"), r)
+
+print("")
+print("18. Псевдонимы хранилищ и совместимость вида с адресом")
+c18 = prepare("alias")
+r = reg(c18, locator={"type": "git", "repository": "/srv/agents/store.git",
+                      "commit": COMMIT})
+check("🔴 произвольный путь вместо псевдонима отклонён", not r.get("ok"), r)
+r = reg(c18, locator={"type": "object_storage", "bucket": "agent-archive",
+                      "key": "k", "version_id": "v"}, digest="d" * 64,
+        digest_alg="sha256")
+check("🔴 git_commit в объектном хранилище отклонён", not r.get("ok"), r)
+r = reg(c18, digest=FAKE)
+check("🔴 отпечаток, не совпадающий с адресом, отклонён", not r.get("ok"), r)
+
+print("")
+print("19. Системная сверка отпечатка: настоящий объект")
+c19 = prepare("verify")
+r = reg(c19)
+p19 = r.get("product_id")
+check("продукт зарегистрирован", r.get("ok"), r)
+out = subprocess.run(["python3", "/opt/agent-control/verifier.py",
+                      "--product", p19], capture_output=True, text=True).stdout
+check("🔴 сверка прошла", "passed" in out, out.strip()[:200])
+st = call("/product", product_id=p19)
+checks19 = {c["проверка"]: c["статус"] for c in st.get("проверки", [])}
+check("digest_verified записана системой", checks19.get("digest_verified") == "passed",
+      checks19)
+call("/product/check", agent_id="exec1", product_id=p19, check_name="tests",
+     status="passed", evidence="прогон")
+st = call("/product", product_id=p19)
+check("🔴 продукт подтверждён после сверки и проверок",
+      st.get("продукт", {}).get("state") == "verified", st.get("продукт"))
+
+print("")
+print("20. Системная сверка: поддельный объект")
+c20 = prepare("fake")
+r = reg(c20, locator={"type": "git", "repository": "agent-store", "commit": FAKE},
+        digest=FAKE)
+p20 = r.get("product_id")
+check("поддельный принят как кандидат", r.get("ok"), r)
+out = subprocess.run(["python3", "/opt/agent-control/verifier.py",
+                      "--product", p20], capture_output=True, text=True).stdout
+check("🔴 сверка провалилась", "failed" in out, out.strip()[:200])
+call("/product/check", agent_id="exec1", product_id=p20, check_name="tests",
+     status="passed", evidence="прогон")
+st = call("/product", product_id=p20)
+check("🔴 поддельный НЕ подтверждён даже при пройденных проверках",
+      st.get("продукт", {}).get("state") == "candidate", st.get("продукт"))
+
+print("")
+print("21. Поздняя неудача снимает подтверждение")
+r = call("/product/check", agent_id="exec1", product_id=p19, check_name="tests",
+         status="failed", evidence="сломалось позже")
+check("🔴 продукт вернулся в кандидаты", r.get("состояние_продукта") == "candidate", r)
+r = call("/product/check", agent_id="exec1", product_id=p19, check_name="tests",
+         status="passed", evidence="починили")
+check("после починки снова подтверждён", r.get("состояние_продукта") == "verified", r)
+
+print("")
+print("22. Протухшая аренда и неполный набор не годятся")
+c22 = prepare("stale")
+import sqlite3 as _s
+con = _s.connect("/opt/agent-control/cp.db")
+con.execute("UPDATE leases SET expires=? WHERE task_id=?",
+            (int(time.time()) - 5, c22["task"]))
+con.commit(); con.close()
+r = reg(c22)
+check("🔴 протухшая аренда отклонена", not r.get("ok"), r)
+
+print("")
+print("23. Поколение аренды обязательно")
+c23 = prepare("fence")
+r = reg(c23, fencing={})
+check("🔴 без поколений отклонено", not r.get("ok"), r)
+r = reg(c23, fencing={k: v + 1 for k, v in c23["fencing"].items()})
+check("🔴 устаревшее поколение отклонено", not r.get("ok"), r)
+
+print("")
+print("24. Ключ повтора не пересекает задачи и содержимое")
+c24a = prepare("idemA")
+c24b = prepare("idemB")
+k = uuid.uuid4().hex
+a24 = reg(c24a, idempotency_key=k)
+check("первый принят", a24.get("ok"), a24)
+b24 = reg(c24b, idempotency_key=k)
+check("🔴 тот же ключ в другой задаче не вернул чужой продукт",
+      b24.get("product_id") != a24.get("product_id"), (a24, b24))
+c24c = reg(c24a, idempotency_key=k, output_slot="impl", digest=FAKE,
+           locator={"type": "git", "repository": "agent-store", "commit": FAKE})
+check("🔴 тот же ключ с другим содержимым — отказ", not c24c.get("ok"), c24c)
 
 print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")
