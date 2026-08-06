@@ -39,13 +39,23 @@ def contract_for(agent, resources, handoff_to="most"):
             "handoff_to": handoff_to}
 
 
+_tasks = set()
+# 🔴 База переживает прогоны: с постоянными именами задача из прошлого запуска
+# осталась бы в состоянии «в работе», и повторное заведение падало бы.
+RUN = uuid.uuid4().hex[:6]
+
+
 def acq(agent, instance, task_id, resources, state="assigned"):
-    """Завести задачу с контрактом и взять по ней аренду — так теперь выглядит
-    законный путь. Раньше аренда бралась «из воздуха»."""
-    r = call("/task", task_id=task_id, title="проверка", agent_id=agent,
-             state=state, contract=contract_for(agent, resources))
-    if not r.get("ok"):
-        return r
+    """Завести задачу с контрактом (один раз) и взять по ней аренду — законный
+    путь. Повторно задачу не пересоздаём: после первого захвата она уже в
+    работе, и выставить ей assigned запросом нельзя по замыслу."""
+    task_id = f"{task_id}-{RUN}"
+    if task_id not in _tasks:
+        r = call("/task", task_id=task_id, title="проверка", agent_id=agent,
+                 state=state, contract=contract_for(agent, resources))
+        if not r.get("ok"):
+            return r
+        _tasks.add(task_id)
     return call("/acquire", agent_id=agent, instance_id=instance, task_id=task_id,
                 resources=list(resources))
 
@@ -70,7 +80,8 @@ check("🔴 непересекающийся ресурс НЕ захвачен 
       "r3 оказался занят — частичный захват, это взаимная блокировка")
 
 print("\n2. Тот же владелец берёт повторно")
-g3 = acq("exec1", a1, "T-1", [r1])
+# повторно берём ТОТ ЖЕ набор: частичный захват теперь запрещён контрактом
+g3 = acq("exec1", a1, "T-1", [r1, r2])
 check("повторный захват своим же процессом разрешён", g3.get("ok"), g3)
 
 print("\n3. Право проверяется, а не подразумевается")
@@ -92,7 +103,8 @@ check("продление подделкой отклонено", not h.get("ok"
 print("\n5. Освобождение и поколение")
 before = call("/check", resource=r1, lease_token=g3["lease_token"])
 call("/release", lease_token=g3["lease_token"])
-after = acq("exec2", a2, "T-2", [r1])
+# у exec2 своя задача со своим контрактом ровно на этот ресурс
+after = acq("exec2", a2, "T-2b", [r1])
 check("после освобождения ресурс достаётся другому", after.get("ok"), after)
 check("🔴 поколение выросло у нового владельца",
       after["fencing"][r1] > g3["fencing"][r1],
@@ -175,9 +187,14 @@ res = "branch:" + uuid.uuid4().hex[:8]
 w = call_as(k2, "/acquire", agent_id="exec1", instance_id="i", resources=[res])
 check("ключом exec2 нельзя действовать как exec1", not w.get("ok"), w)
 # законный путь: сначала задача с контрактом, затем аренда своим ключом
-call_as(k2, "/task", task_id="T-key", title="проверка ключа", agent_id="exec2",
-        state="assigned", contract=contract_for("exec2", [res]))
-w = call_as(k2, "/acquire", agent_id="exec2", instance_id="i", task_id="T-key",
+# 🔴 Контракт создаёт Мост, а не исполнитель — это и проверяется ниже отдельно
+tk = "T-key-" + RUN
+call("/task", task_id=tk, title="проверка ключа", agent_id="exec2",
+     state="assigned", contract=contract_for("exec2", [res]))
+own = call_as(k2, "/task", task_id=tk + "-чужой", title="своя задача",
+              agent_id="exec2", state="assigned", contract=contract_for("exec2", [res]))
+check("🔴 исполнитель не может создать контракт", not own.get("ok"), own)
+w = call_as(k2, "/acquire", agent_id="exec2", instance_id="i", task_id=tk,
             resources=[res])
 check("своим именем можно", w.get("ok"), w)
 if w.get("ok"):
@@ -186,7 +203,7 @@ if w.get("ok"):
 print("")
 print("12. Позднее удержание останавливает уже начатую работу")
 res12 = "branch:" + uuid.uuid4().hex[:8]
-g12 = acq("exec1", a1, "T-12", [res12])
+g12 = acq("exec1", a1, "T-hold", [res12])
 check("аренда взята", g12.get("ok"), g12)
 c = call("/check", resource=res12, lease_token=g12["lease_token"],
          fencing_token=g12["fencing"][res12])
@@ -244,46 +261,73 @@ for body, why in bad:
 print("")
 print("16. Ресурсы аренды обязаны совпадать с контрактом")
 r16 = "branch:" + uuid.uuid4().hex[:8]
+t16 = "T-16-" + RUN          # база переживает прогоны — имя должно быть своё
 lишний = "branch:" + uuid.uuid4().hex[:8]
-call("/task", task_id="T-16", title="проба", agent_id="exec1", state="assigned",
+call("/task", task_id=t16, title="проба", agent_id="exec1", state="assigned",
      contract=contract_for("exec1", [r16]))
-g = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-16",
+g = call("/acquire", agent_id="exec1", instance_id=a1, task_id=t16,
          resources=[r16, lишний])
 check("🔴 лишний ресурс не выдан", not g.get("ok"), g)
-g = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-16", resources=[])
+g = call("/acquire", agent_id="exec1", instance_id=a1, task_id=t16, resources=[])
 check("пустой набор не выдан", not g.get("ok"), g)
-g = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-16", resources=[r16])
+g = call("/acquire", agent_id="exec1", instance_id=a1, task_id=t16, resources=[r16])
 check("ровно те ресурсы — выдано", g.get("ok"), g)
 if g.get("ok"):
     call("/release", lease_token=g["lease_token"])
 
 print("")
 print("17. Аренду берёт только назначенный исполнитель")
-g = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-16", resources=[r16])
+g = call("/acquire", agent_id="exec2", instance_id=a2, task_id=t16, resources=[r16])
 check("🔴 чужую задачу взять нельзя", not g.get("ok"), g)
 
 print("")
-print("18. Контракт неизменяем: правка создаёт версию")
-c1 = call("/contract", task_id="T-16")
+print("18. Контракт неизменяем: правка создаёт версию (пока работа не началась)")
+rv = "branch:" + uuid.uuid4().hex[:8]
+tv = "T-ver-" + RUN
+call("/task", task_id=tv, title="версии", agent_id="exec1", state="assigned",
+     contract=contract_for("exec1", [rv]))
+c1 = call("/contract", task_id=tv)
 check("контракт читается", c1.get("ok"), c1)
-call("/task", task_id="T-16", title="проба", agent_id="exec1", state="assigned",
-     contract=dict(contract_for("exec1", [r16]), objective="другая цель"))
-c2 = call("/contract", task_id="T-16")
+call("/task", task_id=tv, title="версии", agent_id="exec1", state="assigned",
+     contract=dict(contract_for("exec1", [rv]), objective="другая цель"))
+c2 = call("/contract", task_id=tv)
 check("🔴 появилась новая версия", c2.get("версия") == c1.get("версия") + 1,
       (c1.get("версия"), c2.get("версия")))
 check("прошлая версия сохранена", len(c2.get("версии", [])) >= 2, c2.get("версии"))
 check("отпечаток изменился", c2.get("отпечаток") != c1.get("отпечаток"))
-same = call("/task", task_id="T-16", title="проба", agent_id="exec1", state="assigned",
-            contract=dict(contract_for("exec1", [r16]), objective="другая цель"))
-c3 = call("/contract", task_id="T-16")
+call("/task", task_id=tv, title="версии", agent_id="exec1", state="assigned",
+     contract=dict(contract_for("exec1", [rv]), objective="другая цель"))
+c3 = call("/contract", task_id=tv)
 check("тот же контракт новой версии не плодит", c3.get("версия") == c2.get("версия"),
       (c2.get("версия"), c3.get("версия")))
 
 print("")
-print("19. Прямой переход задачи в «готово» запрещён")
-r = call("/task", task_id="T-16", title="проба", agent_id="exec1", state="done")
-check("🔴 задачу нельзя объявить готовой напрямую", not r.get("ok"), r)
-check("причина названа", "запрещ" in str(r.get("причина", "")), r)
+print("19. Под действующей арендой контракт не меняется")
+g19 = call("/acquire", agent_id="exec1", instance_id=a1, task_id=tv, resources=[rv])
+check("аренда взята", g19.get("ok"), g19)
+before = call("/contract", task_id=tv)
+r = call("/task", task_id=tv, title="версии", agent_id="exec1", state="assigned",
+         contract=dict(contract_for("exec1", [rv]), objective="третья цель"))
+check("🔴 правка под арендой отклонена", not r.get("ok"), r)
+after = call("/contract", task_id=tv)
+check("действующая версия не изменилась",
+      after.get("версия") == before.get("версия"), (before.get("версия"),
+                                                    after.get("версия")))
+c = call("/check", resource=rv, lease_token=g19["lease_token"],
+         fencing_token=g19["fencing"][rv])
+check("аренда осталась действительной", c.get("allow"), c)
+check("🔴 задача переведена в работу захватом",
+      any(t["task_id"] == tv and t["state"] == "running"
+          for t in call("/status")["задачи"]),
+      [t for t in call("/status")["задачи"] if t["task_id"] == tv])
+call("/release", lease_token=g19["lease_token"])
+
+print("")
+print("20. Служебные состояния запросом не выставляются")
+for st in ("running", "handoff_pending", "done"):
+    r = call("/task", task_id=tv, title="версии", agent_id="exec1", state=st)
+    check(f"🔴 состояние {st} запросом не выставить", not r.get("ok"), r)
+    check("причина названа", "выставляется системой" in str(r.get("причина", "")), r)
 
 print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")

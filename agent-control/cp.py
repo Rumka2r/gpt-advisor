@@ -297,20 +297,22 @@ def acquire(con, d):
     task_id = d.get("task_id")
     t = now()
 
-    # 🔴 Аренда выдаётся только под задачу с действующим контрактом, только
-    # назначенному исполнителю и только на ТЕ ресурсы, что в контракте.
-    # Исключение — служебный захват сборщика: у него задачи нет по смыслу.
-    ver = digest = None
-    if agent_id != "gc":
-        if not task_id:
-            return {"ok": False, "причина": "аренда без задачи не выдаётся"}
-        err, ver, digest = contracts.check_acquire(con, task_id, agent_id, resources)
-        if err:
-            return {"ok": False, "причина": err} if isinstance(err, str) else \
-                   {"ok": False, **err}
+    # 🔴 Служебный путь у сборщика отдельный (/gc/claim). Здесь исключений нет:
+    # иначе контракт обходился бы простым представлением именем gc.
+    if not task_id:
+        return {"ok": False, "причина": "аренда без задачи не выдаётся"}
 
+    ver = digest = None
     con.execute("BEGIN IMMEDIATE")
     try:
+        # 🔴 Проверка контракта — ВНУТРИ той же транзакции, что и вставка аренды.
+        # Снаружи между проверкой и выдачей успевала появиться новая версия
+        # контракта, и аренда выдавалась по условиям уже недействующей.
+        err, ver, digest = contracts.check_acquire(con, task_id, agent_id, resources)
+        if err:
+            con.execute("ROLLBACK")
+            return {"ok": False, "причина": err} if isinstance(err, str) else \
+                   {"ok": False, **err}
         sweep(con)
         busy = []
         # 🔴 Удержание сравниваем ПО ПЕРЕСЕЧЕНИЮ, а не по точному совпадению имени:
@@ -349,6 +351,11 @@ def acquire(con, d):
                         "acquired=excluded.acquired, expires=excluded.expires",
                         (r, task_id, agent_id, instance_id, d.get("host_id", ""),
                          d.get("boot_id", ""), token, n, t, t + TTL_S, d.get("pid", 0)))
+        # 🔴 Состояние «в работе» выставляет УСПЕШНЫЙ захват, а не клиент: только
+        # так момент начала работы совпадает с моментом, когда условия
+        # зафиксированы.
+        con.execute("UPDATE tasks SET state='running', updated=? "
+                    "WHERE task_id=? AND state='assigned'", (t, task_id))
         log(con, agent_id, task_id, "lease_acquired",
             {"resources": resources, "fencing": fencing,
              "версия_контракта": ver, "отпечаток_контракта": digest})
@@ -469,6 +476,34 @@ def task_create(con, d):
     Изменение контракта создаёт НОВУЮ версию, прошлая остаётся в истории."""
     task_id = d["task_id"]
     state = d.get("state", "created")
+
+    # 🔴 Служебные состояния клиент не выставляет НИКОГДА:
+    #   running          ставит успешный захват аренды;
+    #   handoff_pending  ставит создание передачи результата;
+    #   done             ставит приём передачи.
+    # Иначе запрет «нельзя объявить задачу готовой» обходится двумя запросами.
+    SERVICE_STATES = ("running", "handoff_pending", "done")
+    if state in SERVICE_STATES:
+        return {"ok": False,
+                "причина": f"состояние {state} выставляется системой, а не запросом: "
+                           f"running — захватом аренды, handoff_pending — созданием "
+                           f"передачи, done — её приёмом"}
+
+    body = d.get("contract")
+    # 🔴 Контракты создаёт и меняет только Мост. Исполнитель может лишь сообщить,
+    # что застрял. Иначе он правит чужие задачи и подставляет другого исполнителя.
+    if body is not None and not d.get("_admin"):
+        return {"ok": False, "причина": "контракт задачи создаёт и меняет только Мост"}
+    if not d.get("_admin"):
+        owner = (con.execute("SELECT agent_id FROM tasks WHERE task_id=?",
+                             (task_id,)).fetchone() or [None])[0]
+        if owner and owner != d.get("agent_id"):
+            return {"ok": False, "причина": f"задача назначена на {owner}"}
+        if state not in ("blocked", "assigned", "cancelled"):
+            return {"ok": False,
+                    "причина": "исполнитель может выставить только blocked, "
+                               "assigned или cancelled"}
+
     ok, why = contracts.can_transition(
         (con.execute("SELECT state FROM tasks WHERE task_id=?",
                      (task_id,)).fetchone() or ["created"])[0], state)
@@ -481,7 +516,6 @@ def task_create(con, d):
             log(con, d.get("agent_id"), task_id, "task_refused", {"причина": why})
             return {"ok": False, "причина": why}
 
-    body = d.get("contract")
     if body is None and not con.execute(
             "SELECT 1 FROM task_contracts WHERE task_id=? AND active=1",
             (task_id,)).fetchone():
@@ -494,6 +528,10 @@ def task_create(con, d):
     try:
         ver = None
         if body is not None:
+            allowed, why2 = contracts.may_change(con, task_id)
+            if not allowed:
+                con.execute("ROLLBACK")
+                return {"ok": False, "причина": why2}
             # 🔴 Пока работа идёт, менять условия нельзя молча: новая версия
             # заводится, но исполнитель узнаёт об этом по номеру версии в аренде.
             ver, errs = contracts.put(con, task_id, body, d.get("agent_id", ""),

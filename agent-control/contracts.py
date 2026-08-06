@@ -118,8 +118,17 @@ def validate(body, canon_resource=None):
             if not isinstance(o.get("required", True), bool):
                 errs.append(f"выход {slot}: required должен быть да/нет")
             checks = o.get("checks", [])
-            if not isinstance(checks, list) or not all(isinstance(c, str) for c in checks):
+            if not isinstance(checks, list) or not all(isinstance(x, str) for x in checks):
                 errs.append(f"выход {slot}: checks должен быть списком названий проверок")
+            elif any(not x.strip() for x in checks):
+                errs.append(f"выход {slot}: пустое название проверки")
+            elif len(set(checks)) != len(checks):
+                errs.append(f"выход {slot}: названия проверок повторяются")
+            else:
+                # 🔴 Умолчания записываем ЯВНО: иначе отпечаток контракта зависит
+                # от того, указал ли автор поле, а смысл при этом один и тот же.
+                o["required"] = bool(o.get("required", True))
+                o["checks"] = list(checks)
         if len(set(slots)) != len(slots):
             errs.append("слоты выходов повторяются")
         if not any(o.get("required", True) for o in outs if isinstance(o, dict)):
@@ -167,6 +176,10 @@ CREATE TABLE IF NOT EXISTS task_contracts(
     created_at INTEGER NOT NULL, active INTEGER NOT NULL,
     PRIMARY KEY(task_id, version));
 CREATE INDEX IF NOT EXISTS tc_active ON task_contracts(task_id, active);
+-- 🔴 Действующая версия ровно одна: без этого две активные версии сделали бы
+-- ответ на вопрос «по каким условиям работа принята» неоднозначным.
+CREATE UNIQUE INDEX IF NOT EXISTS tc_one_active
+    ON task_contracts(task_id) WHERE active=1;
 """
 
 
@@ -207,6 +220,29 @@ def can_transition(frm, to):
     if to not in allowed:
         return False, (f"переход {frm} → {to} запрещён; из {frm} можно: "
                        f"{', '.join(sorted(allowed)) or 'никуда'}")
+    return True, ""
+
+
+def has_active_lease(con, task_id):
+    row = con.execute("SELECT COUNT(*) FROM leases WHERE task_id=?",
+                      (task_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def may_change(con, task_id):
+    """🔴 Менять условия под работающим исполнителем нельзя: уже выданная аренда
+    о новой версии не узнает никогда — ни сердцебиение, ни проверка права её не
+    сверяют. Поэтому правка допустима только до начала работы и только пока нет
+    ни одной действующей аренды."""
+    row = con.execute("SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    if not row:
+        return True, ""
+    state = row[0]
+    if state not in ("created", "assigned", "blocked"):
+        return False, (f"задача в состоянии {state}: менять контракт можно только "
+                       f"в created, assigned или blocked")
+    if has_active_lease(con, task_id):
+        return False, "у задачи есть действующая аренда — контракт не меняется"
     return True, ""
 
 
