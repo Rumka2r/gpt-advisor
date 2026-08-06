@@ -1,32 +1,53 @@
 # Состояние развёрнутой системы
 
-## Реестр ожидаемых зон
-    /srv/agents/exec2
-    проверка зоны: (True, '')
+Снимок с сервера: то, чего нет в коде.
 
-## Права зоны
-    drwxr-xr-x 11 root   agent2 4096 Aug  5 22:45 /srv/agents/exec2
-    drwx------  2 root   root   4096 Aug  5 22:45 /srv/agents/exec2/.quarantine
-    drwxrwxr-x 13 agent2 agent2 4096 Aug  5 22:52 /srv/agents/exec2/work
+## Координатор — RC1, заморожен
+    коммит a81e1dc, метка agent-control-rc1
+    модули: cp.py=92f49359 contracts.py=79403537 products.py=110293b5 handoffs.py=4f0db8f2 verifier.py=b0e94156 
+    порт 8010 + сокет по UID; снимок базы /var/agent-backup/rc1/cp.db (онлайн, целостность ok)
 
-## Границы исполнителя (код возврата)
-    переименовать карантин код 1 (нужен НЕ 0)
-    удалить карантин    код 1 (нужен НЕ 0)
-    писать в корень зоны код 1 (нужен НЕ 0)
-    писать в свою работу код 0 (нужен 0)
-    писать в архив         код 128 (нужен НЕ 0)
+## Проверки
+    test_cp          ИТОГ: 90 из 90
+    test_products    ИТОГ: 67 из 67
+    test_gc          ИТОГ: 79 из 79
+    test_handoffs    ИТОГ: 58 из 58
 
-## Прогоны
-    координатор: ИТОГ: 35 из 35
-    сборщик:     ИТОГ: 71 из 71
+## Граница эксперимента
+    {
+     "run_id": "RC1-20260806T043935Z",
+     "начало_события_id": 2032,
+     "начало_метка_времени": 1785991175,
+     "коммит": "a81e1dc",
+     "метка": "agent-control-rc1",
+     "серии": {
+      "EXP-A": "независимая работа",
+      "EXP-B": "контролируемый конфликт",
+      "EXP-C": "отказ, исправление, приём"
+     },
+     "снимок_базы": "/var/agent-backup/rc1/cp.db"
+    }
+## Исполнитель-2
+    служба: active
+    порт 8002, ответ /api/health: 200
+    база plumbingcore_exec2, схема whrequq01, таблиц 223
+    том: /dev/loop0       15G  754M   14G   6% /srv/agents/exec2
+    срез agent-exec2.slice, пользователь agent2
+
+## Границы исполнителя-2 (код возврата)
+    читать окружение песочницы код 1
+    читать чужую копию код 2
+    писать в архив истории код 128
+    тронуть свой карантин код 1
 
 ## Службы и диск
     agent-cp                   active
     agent-gc.timer             active
     agent-diskwatch.timer      active
-    plumbingcore-sandbox       active
     plumbingcore-prod          active
-    /dev/sda1       150G  112G   32G  78% /
+    plumbingcore-sandbox       active
+    plumbingcore-exec2         active
+    /dev/sda1       150G  113G   32G  79% /
 
-## Запуск сборщика (без --apply)
-    ExecStart=/usr/bin/python3 /opt/agent-control/gc.py run
+## Сборщик
+    ExecStart=/usr/bin/python3 /opt/agent-control/gc.py run --apply --scope zones --skip-rescue-cleanup
