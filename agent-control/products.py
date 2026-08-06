@@ -120,9 +120,15 @@ def migrate(con):
     cols = {r[1] for r in con.execute("PRAGMA table_info(work_products)")}
     if not cols:
         return False
-    sql = (con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND "
-                       "name='work_products'").fetchone() or [""])[0] or ""
-    need = ("request_sha256" not in cols) or ("FOREIGN KEY" not in sql.upper())
+    # 🔴 Смотрим фактические внешние ключи ОБЕИХ таблиц, а не текст одной:
+    # частично перенесённая база (ключи есть у продуктов, но нет у проверок)
+    # иначе считалась бы готовой.
+    # составной ключ возвращает по строке на столбец — считаем именно ключи
+    fk_products = len({r[0] for r in con.execute(
+        "PRAGMA foreign_key_list(work_products)")})
+    fk_checks = len({r[0] for r in con.execute(
+        "PRAGMA foreign_key_list(product_checks)")})
+    need = ("request_sha256" not in cols) or fk_products < 2 or fk_checks < 1
     if not need:
         return False
 
@@ -219,7 +225,8 @@ def check_locator(kind, loc):
 
     if t == "object_storage":
         alias = loc.get("bucket")
-        if alias not in OBJECT_STORES:
+        store = OBJECT_STORES.get(alias)
+        if store is None:
             return (f"хранилище {alias!r} не значится в серверном каталоге; "
                     f"допустимые: {', '.join(sorted(OBJECT_STORES))}"), None, None
         for f in ("key", "version_id"):

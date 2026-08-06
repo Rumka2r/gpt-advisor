@@ -151,18 +151,25 @@ def record(con, product_id, status, evidence):
 
 
 def pending(con):
-    """Кандидаты, у которых сверка ещё не проходила или закончилась ошибкой."""
-    rows = con.execute("""
+    """Кандидаты, у которых сверка ещё не прошла успешно.
+
+    🔴 Берём ТОЛЬКО те виды хранилищ, которые умеем проверять. Иначе каждый
+    запуск снова находил бы объектных кандидатов и дописывал им очередную
+    неудачную попытку — бесконечный рост таблицы проверок и постоянный шум.
+    """
+    allowed = tuple(products.VERIFIABLE)
+    marks = ",".join("?" for _ in allowed)
+    return con.execute(f"""
         SELECT p.product_id, p.locator_type, p.locator, p.digest
         FROM work_products p
-        WHERE p.state = 'candidate' AND p.locator_type IN ('git','object_storage')
+        WHERE p.state = 'candidate'
+          AND p.locator_type IN ({marks})
           AND NOT EXISTS (
             SELECT 1 FROM product_checks c
             WHERE c.product_id = p.product_id AND c.check_name = ?
               AND c.status = 'passed')
         ORDER BY p.registered_at
-    """, (products.DIGEST_CHECK,)).fetchall()
-    return rows
+    """, (*allowed, products.DIGEST_CHECK)).fetchall()
 
 
 def verify_one(product_id, ltype, locator, digest):
@@ -192,6 +199,11 @@ def main():
         row = con.execute("SELECT product_id, locator_type, locator, digest "
                           "FROM work_products WHERE product_id=?",
                           (a.product,)).fetchone()
+        if row and row[1] not in products.VERIFIABLE:
+            # Отказ БЕЗ записи проверки: иначе ручной запуск тоже засорял бы
+            # историю неудачными попытками.
+            print(f"тип {row[1]} пока не поддерживает системную сверку")
+            return 2
         rows = [row] if row else []
     else:
         rows = pending(con)

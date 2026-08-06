@@ -338,5 +338,115 @@ c24c = reg(c24a, idempotency_key=k, output_slot="impl", digest=FAKE,
 check("🔴 тот же ключ с другим содержимым — отказ", not c24c.get("ok"), c24c)
 
 print("")
+print("25. Непроверяемый тип не копит неудачные попытки")
+c25 = prepare("nostore", kind="report")
+r = reg(c25, kind="report",
+        locator={"type": "object_storage", "bucket": "agent-archive",
+                 "key": "agent-history/tasks/x.json", "version_id": "v1"},
+        digest="e" * 64, digest_alg="sha256")
+check("объектный продукт зарегистрирован", r.get("ok"), r)
+p25 = r.get("product_id")
+for _ in range(2):
+    subprocess.run(["python3", "/opt/agent-control/verifier.py"],
+                   capture_output=True, text=True)
+st = call("/product", product_id=p25)
+digest_tries = [c for c in st.get("проверки", []) if c["проверка"] == "digest_verified"]
+check("🔴 два прохода не создали ни одной попытки", not digest_tries, digest_tries)
+out = subprocess.run(["python3", "/opt/agent-control/verifier.py", "--product", p25],
+                     capture_output=True, text=True)
+check("ручной запуск честно отказывает", out.returncode == 2, out.stdout.strip()[:120])
+check("продукт остался кандидатом",
+      call("/product", product_id=p25).get("продукт", {}).get("state") == "candidate")
+
+print("")
+print("26. Ключ вне отведённого пространства отклоняется")
+r = reg(c25, kind="report",
+        locator={"type": "object_storage", "bucket": "agent-archive",
+                 "key": "db/prod-dump.sql", "version_id": "v1"},
+        digest="e" * 64, digest_alg="sha256")
+check("🔴 чужое пространство корзины отклонено", not r.get("ok"), r)
+
+print("")
+print("27. Файл, выданный за коммит, не проходит сверку")
+blob = subprocess.run(["git", "-C", "/srv/agents/store.git", "rev-parse",
+                       COMMIT + ":.gitignore"], capture_output=True,
+                      text=True).stdout.strip()
+if not blob:
+    blob = subprocess.run(
+        ["bash", "-c", f"git -C /srv/agents/store.git ls-tree {COMMIT} | "
+                       f"awk '$2==\"blob\"{{print $3; exit}}'"],
+        capture_output=True, text=True).stdout.strip()
+if blob:
+    c27 = prepare("blob")
+    r = reg(c27, locator={"type": "git", "repository": "agent-store",
+                          "commit": blob}, digest=blob)
+    if r.get("ok"):
+        out = subprocess.run(["python3", "/opt/agent-control/verifier.py",
+                              "--product", r["product_id"]],
+                             capture_output=True, text=True).stdout
+        check("🔴 файл, выданный за коммит, отклонён", "failed" in out,
+              out.strip()[:160])
+        st = call("/product", product_id=r["product_id"])
+        check("остался кандидатом",
+              st.get("продукт", {}).get("state") == "candidate", st.get("продукт"))
+    else:
+        check("файл, выданный за коммит, отклонён", False, r)
+else:
+    check("файл, выданный за коммит, отклонён", False, "не нашёл blob в архиве")
+
+print("")
+print("28. Внешние ключи действительно в схеме и работают")
+import sqlite3 as _sq
+con28 = _sq.connect("/opt/agent-control/cp.db")
+fk_p = list(con28.execute("PRAGMA foreign_key_list(work_products)"))
+fk_c = list(con28.execute("PRAGMA foreign_key_list(product_checks)"))
+# составной ключ даёт по строке на КАЖДЫЙ столбец — считаем сами ключи
+check("🔴 два внешних ключа у продуктов", len({r[0] for r in fk_p}) == 2, fk_p)
+check("🔴 один внешний ключ у проверок", len({r[0] for r in fk_c}) == 1, fk_c)
+con28.execute("PRAGMA foreign_keys=ON")
+try:
+    con28.execute("INSERT INTO product_checks VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  ("chk-сирота", "нет-такого-продукта", "tests", 1, "passed",
+                   "exec1", None, "", None, int(time.time())))
+    con28.commit()
+    check("🔴 вставка сироты отклонена", False, "сирота прошла")
+except _sq.IntegrityError as e:
+    check("🔴 вставка сироты отклонена", True)
+con28.close()
+
+print("")
+print("29. Ключ повтора после смены контракта не возвращает старый продукт")
+c29 = prepare("verchange")
+k29 = uuid.uuid4().hex
+a29 = reg(c29, idempotency_key=k29)
+check("продукт версии 1 создан", a29.get("ok"), a29)
+call("/release", lease_token=c29["lease"])
+call("/task", task_id=c29["task"], title="verchange", agent_id="exec1",
+     state="blocked")
+call("/task", task_id=c29["task"], title="verchange", agent_id="exec1",
+     state="assigned",
+     contract=dict(contract("exec1", c29["res"]), objective="изменённая цель"))
+c2 = call("/contract", task_id=c29["task"])
+g = call("/acquire", agent_id="exec1", instance_id=c29["inst"],
+         task_id=c29["task"], resources=[c29["res"]])
+if g.get("ok") and c2.get("версия", 1) > 1:
+    b29 = call("/product/register", task_id=c29["task"], agent_id="exec1",
+               contract_version=c2["версия"], contract_sha256=c2["отпечаток"],
+               output_slot="impl", kind="git_commit",
+               locator={"type": "git", "repository": "agent-store",
+                        "commit": COMMIT},
+               digest=COMMIT, digest_alg="git_sha1", lease_token=g["lease_token"],
+               instance_id=c29["inst"], fencing=g["fencing"],
+               idempotency_key=k29)
+    # 🔴 Правильный ответ — именно ОТКАЗ: тот же ключ после смены условий
+    # больше не повтор. Возврат старого продукта был бы подлогом.
+    check("🔴 после смены контракта тот же ключ даёт отказ",
+          not b29.get("ok") and "другим содержимым" in str(b29.get("причина", "")),
+          b29)
+else:
+    check("после смены контракта тот же ключ не вернул старый продукт", False,
+          (g, c2))
+
+print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")
 sys.exit(0 if N[1] == N[0] else 1)
