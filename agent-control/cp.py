@@ -44,10 +44,13 @@ import threading
 import time
 import uuid
 
-ROOT = "/opt/agent-control"
-DB = os.path.join(ROOT, "cp.db")
+# 🔴 Пути и порт берутся из окружения: иначе проверочный запуск перед
+# развёртыванием пришлось бы делать поверх боевой базы и боевого порта.
+ROOT = os.environ.get("CP_ROOT", "/opt/agent-control")
+DB = os.environ.get("CP_DB", os.path.join(ROOT, "cp.db"))
 KEYFILE = os.path.join(ROOT, "api.key")
-HOST, PORT = "127.0.0.1", 8010
+HOST = os.environ.get("CP_HOST", "127.0.0.1")
+PORT = int(os.environ.get("CP_PORT", "8010"))
 
 HEARTBEAT_S = 20          # как часто агент обязан отмечаться
 TTL_S = 90                # через сколько молчания аренда считается брошенной
@@ -470,18 +473,37 @@ def register(con, d):
     return {"ok": True, "heartbeat_s": HEARTBEAT_S, "ttl_s": TTL_S}
 
 
+def revoke_task_leases(con, task_id, why):
+    """🔴 Снять все аренды задачи и поднять поколения. Без этого блокировка и
+    отмена задачи ничего не значат: проверка права смотрит только на аренду,
+    удержание и поколение, а состояние задачи в ней не участвует — и процесс
+    продолжает работать над отменённой задачей."""
+    revoked = []
+    for res, agent in con.execute("SELECT resource, agent_id FROM leases "
+                                  "WHERE task_id=?", (task_id,)).fetchall():
+        con.execute("DELETE FROM leases WHERE resource=?", (res,))
+        bump(con, res)
+        revoked.append(res)
+        log(con, agent, task_id, "task_lease_revoked", {"resource": res, "причина": why})
+    return revoked
+
+
 def task_create(con, d):
-    """Завести или изменить задачу. 🔴 Контракт обязателен и проверяется схемой:
-    задача без ожидаемого результата ничего не обязывает и ничего не доказывает.
-    Изменение контракта создаёт НОВУЮ версию, прошлая остаётся в истории."""
+    """Завести или изменить задачу. 🔴 Контракт обязателен и проверяется схемой.
+
+    🔴 ВСЁ решение — внутри одной транзакции: чтение владельца и состояния,
+    проверка перехода, проверка контракта, отзыв аренд и запись. Снаружи два
+    одновременных запроса читали одно состояние и оба считали свой переход
+    разрешённым — так `running → cancelled` и `running → blocked` давали в итоге
+    запрещённое `cancelled → blocked`.
+    """
     task_id = d["task_id"]
     state = d.get("state", "created")
 
-    # 🔴 Служебные состояния клиент не выставляет НИКОГДА:
+    # Служебные состояния клиент не выставляет НИКОГДА:
     #   running          ставит успешный захват аренды;
     #   handoff_pending  ставит создание передачи результата;
     #   done             ставит приём передачи.
-    # Иначе запрет «нельзя объявить задачу готовой» обходится двумя запросами.
     SERVICE_STATES = ("running", "handoff_pending", "done")
     if state in SERVICE_STATES:
         return {"ok": False,
@@ -490,55 +512,61 @@ def task_create(con, d):
                            f"передачи, done — её приёмом"}
 
     body = d.get("contract")
-    # 🔴 Контракты создаёт и меняет только Мост. Исполнитель может лишь сообщить,
-    # что застрял. Иначе он правит чужие задачи и подставляет другого исполнителя.
     if body is not None and not d.get("_admin"):
         return {"ok": False, "причина": "контракт задачи создаёт и меняет только Мост"}
-    if not d.get("_admin"):
-        owner = (con.execute("SELECT agent_id FROM tasks WHERE task_id=?",
-                             (task_id,)).fetchone() or [None])[0]
-        if owner and owner != d.get("agent_id"):
-            return {"ok": False, "причина": f"задача назначена на {owner}"}
-        if state not in ("blocked", "assigned", "cancelled"):
-            return {"ok": False,
-                    "причина": "исполнитель может выставить только blocked, "
-                               "assigned или cancelled"}
-
-    ok, why = contracts.can_transition(
-        (con.execute("SELECT state FROM tasks WHERE task_id=?",
-                     (task_id,)).fetchone() or ["created"])[0], state)
-    if not ok:
-        return {"ok": False, "причина": why}
-
-    if state in ("created", "assigned"):
-        ok, why = disk_gate("task")
-        if not ok:
-            log(con, d.get("agent_id"), task_id, "task_refused", {"причина": why})
-            return {"ok": False, "причина": why}
-
-    if body is None and not con.execute(
-            "SELECT 1 FROM task_contracts WHERE task_id=? AND active=1",
-            (task_id,)).fetchone():
-        return {"ok": False,
-                "причина": "у задачи должен быть контракт: цель, исполнитель, "
-                           "ресурсы, ожидаемые результаты и кому передавать"}
 
     t = now()
     con.execute("BEGIN IMMEDIATE")
     try:
-        ver = None
+        row = con.execute("SELECT state, agent_id FROM tasks WHERE task_id=?",
+                          (task_id,)).fetchone()
+        cur_state = row[0] if row else "created"
+        owner = row[1] if row else None
+
+        if not d.get("_admin"):
+            if owner and owner != d.get("agent_id"):
+                con.execute("ROLLBACK")
+                return {"ok": False, "причина": f"задача назначена на {owner}"}
+            if state not in ("blocked", "assigned", "cancelled"):
+                con.execute("ROLLBACK")
+                return {"ok": False,
+                        "причина": "исполнитель может выставить только blocked, "
+                                   "assigned или cancelled"}
+
+        ok, why = contracts.can_transition(cur_state, state)
+        if not ok:
+            con.execute("ROLLBACK")
+            return {"ok": False, "причина": why}
+
+        if state in ("created", "assigned"):
+            ok, why = disk_gate("task")
+            if not ok:
+                con.execute("ROLLBACK")
+                return {"ok": False, "причина": why}
+
+        if body is None and not con.execute(
+                "SELECT 1 FROM task_contracts WHERE task_id=? AND active=1",
+                (task_id,)).fetchone():
+            con.execute("ROLLBACK")
+            return {"ok": False,
+                    "причина": "у задачи должен быть контракт: цель, исполнитель, "
+                               "ресурсы, ожидаемые результаты и кому передавать"}
+
         if body is not None:
             allowed, why2 = contracts.may_change(con, task_id)
             if not allowed:
                 con.execute("ROLLBACK")
                 return {"ok": False, "причина": why2}
-            # 🔴 Пока работа идёт, менять условия нельзя молча: новая версия
-            # заводится, но исполнитель узнаёт об этом по номеру версии в аренде.
             ver, errs = contracts.put(con, task_id, body, d.get("agent_id", ""),
                                       canon_resource=canon)
             if errs:
                 con.execute("ROLLBACK")
                 return {"ok": False, "причина": "контракт не принят", "ошибки": errs}
+
+        revoked = []
+        if state in ("blocked", "cancelled"):
+            revoked = revoke_task_leases(con, task_id, f"задача переведена в {state}")
+
         act = contracts.active(con, task_id)
         assignee = (act[1].get("assignee") if act else d.get("agent_id", ""))
         con.execute(
@@ -550,11 +578,12 @@ def task_create(con, d):
                         ensure_ascii=False)))
         log(con, d.get("agent_id"), task_id, "task_" + state,
             {"title": d.get("title", ""), "версия_контракта": act[0] if act else None,
-             "отпечаток": (act[2][:16] if act else None)})
+             "отпечаток": (act[2][:16] if act else None),
+             "отозвано_аренд": len(revoked)})
         con.execute("COMMIT")
         return {"ok": True, "версия_контракта": act[0] if act else None,
                 "отпечаток_контракта": act[2] if act else None,
-                "состояние": state}
+                "состояние": state, "отозванные_аренды": revoked}
     except Exception as e:
         con.execute("ROLLBACK")
         return {"ok": False, "причина": f"сбой: {e}"}
@@ -787,7 +816,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 # ── Unix-сокет: личность по UID, а не по ключу ──────────────────────────────
 # 🔴 Надёжнее файлов с ключами: ядро само сообщает, какой пользователь на том
 # конце. Представиться другим невозможно в принципе — ключ нечего красть.
-SOCKET = os.path.join(ROOT, "cp.sock")
+SOCKET = os.environ.get("CP_SOCKET", os.path.join(ROOT, "cp.sock"))
 MAPFILE = os.path.join(ROOT, "agents.map")
 
 

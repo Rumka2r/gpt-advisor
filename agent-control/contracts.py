@@ -20,6 +20,7 @@
 
 import hashlib
 import json
+import re
 import time
 
 SCHEMA_VERSION = 1
@@ -33,7 +34,10 @@ TRANSITIONS = {
     "assigned": {"running", "blocked", "cancelled"},
     "running": {"handoff_pending", "blocked", "cancelled"},
     "handoff_pending": {"done", "running", "blocked"},
-    "blocked": {"running", "cancelled"},
+    # 🔴 Из блокировки возвращаемся в assigned, а не сразу в работу: running
+    # выставляет только успешный захват аренды. Раньше blocked был тупиком —
+    # выйти из него можно было лишь отменой задачи.
+    "blocked": {"assigned", "cancelled"},
     "done": set(),
     "cancelled": set(),
 }
@@ -41,6 +45,35 @@ WORKABLE = ("assigned", "running")
 
 KINDS = ("git_commit", "git_ref", "object", "report", "dataset", "config")
 LOCATOR_TYPES = ("git", "object_storage", "path")
+
+# 🔴 Неизменяемые виды расположения. Обычный путь на диске закрыть обязательный
+# результат не может: файл на диске завтра будет другим, и доказать, что задача
+# произвела именно этот результат, нечем.
+IMMUTABLE_LOCATORS = ("git", "object_storage")
+
+# 🔴 Списки разрешённых ключей. Без них опечатка `cheks` тихо проходит как
+# отсутствие проверок, и реестр продуктов решит, что контракт их не требовал.
+KEYS_CONTRACT = {"schema_version", "objective", "assignee", "resources",
+                 "inputs", "outputs", "constraints", "handoff_to"}
+KEYS_OUTPUT = {"slot", "kind", "required", "checks"}
+KEYS_INPUT = {"name", "locator"}
+KEYS_CONSTRAINTS = {"forbidden_actions", "deadline"}
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+
+
+def norm_name(x):
+    """Имя слота или проверки: без краевых пробелов, в нижнем регистре.
+    Иначе `result` и ` result ` — разные слоты, а `tests` и ` tests ` — разные
+    проверки, и контракт перестаёт что-либо гарантировать."""
+    return " ".join(str(x).split()).strip().lower()
+
+
+def unknown_keys(obj, allowed, where, errs):
+    extra = sorted(set(obj) - allowed)
+    if extra:
+        errs.append(f"{where}: неизвестные поля {', '.join(extra)} "
+                    f"(опечатка? допустимы: {', '.join(sorted(allowed))})")
 
 
 def now():
@@ -69,6 +102,7 @@ def validate(body, canon_resource=None):
     if not isinstance(body, dict):
         return ["контракт должен быть объектом"], None
     b = dict(body)
+    unknown_keys(b, KEYS_CONTRACT, "контракт", errs)
 
     v = b.get("schema_version")
     if v != SCHEMA_VERSION:
@@ -108,27 +142,41 @@ def validate(body, canon_resource=None):
             if not isinstance(o, dict):
                 errs.append(f"выход должен быть объектом: {o!r}")
                 continue
-            slot = o.get("slot")
-            if not isinstance(slot, str) or not slot.strip():
-                errs.append("у выхода обязателен непустой slot")
+            unknown_keys(o, KEYS_OUTPUT, "выход", errs)
+            slot = norm_name(o.get("slot", ""))
+            if not NAME_RE.match(slot):
+                errs.append(f"слот {o.get('slot')!r}: имя должно быть вида "
+                            f"{NAME_RE.pattern}")
                 continue
+            o["slot"] = slot
             slots.append(slot)
             if o.get("kind") not in KINDS:
                 errs.append(f"выход {slot}: kind должен быть из {', '.join(KINDS)}")
-            if not isinstance(o.get("required", True), bool):
+            req = o.get("required", True)
+            if not isinstance(req, bool):
                 errs.append(f"выход {slot}: required должен быть да/нет")
+                req = True
+            o["required"] = bool(req)
+
             checks = o.get("checks", [])
             if not isinstance(checks, list) or not all(isinstance(x, str) for x in checks):
                 errs.append(f"выход {slot}: checks должен быть списком названий проверок")
-            elif any(not x.strip() for x in checks):
-                errs.append(f"выход {slot}: пустое название проверки")
-            elif len(set(checks)) != len(checks):
+                continue
+            names = [norm_name(x) for x in checks]
+            bad = [x for x in names if not NAME_RE.match(x)]
+            if bad:
+                errs.append(f"выход {slot}: негодные названия проверок: "
+                            f"{', '.join(bad) or 'пустые'}")
+                continue
+            if len(set(names)) != len(names):
                 errs.append(f"выход {slot}: названия проверок повторяются")
-            else:
-                # 🔴 Умолчания записываем ЯВНО: иначе отпечаток контракта зависит
-                # от того, указал ли автор поле, а смысл при этом один и тот же.
-                o["required"] = bool(o.get("required", True))
-                o["checks"] = list(checks)
+                continue
+            # 🔴 Обязательный результат без единой проверки бессмыслен: реестр
+            # примет что угодно и сочтёт задачу выполненной.
+            if o["required"] and not names:
+                errs.append(f"выход {slot}: у обязательного результата должна быть "
+                            f"хотя бы одна проверка, например digest_verified")
+            o["checks"] = names
         if len(set(slots)) != len(slots):
             errs.append("слоты выходов повторяются")
         if not any(o.get("required", True) for o in outs if isinstance(o, dict)):
@@ -142,6 +190,7 @@ def validate(body, canon_resource=None):
             if not isinstance(i, dict) or not isinstance(i.get("name"), str):
                 errs.append(f"вход должен быть объектом с именем: {i!r}")
                 continue
+            unknown_keys(i, KEYS_INPUT, f"вход {i.get('name')}", errs)
             loc = i.get("locator")
             if not isinstance(loc, dict) or loc.get("type") not in LOCATOR_TYPES:
                 errs.append(f"вход {i.get('name')}: locator.type должен быть из "
@@ -151,13 +200,19 @@ def validate(body, canon_resource=None):
     if not isinstance(con, dict):
         errs.append("constraints должен быть объектом")
     else:
+        unknown_keys(con, KEYS_CONSTRAINTS, "constraints", errs)
         fa = con.get("forbidden_actions", [])
-        if not isinstance(fa, list):
-            errs.append("constraints.forbidden_actions должен быть списком")
         dl = con.get("deadline")
+        ok_fa = isinstance(fa, list) and all(isinstance(x, str) for x in fa)
+        if not ok_fa:
+            errs.append("constraints.forbidden_actions должен быть списком строк")
         if dl is not None and not isinstance(dl, int):
             errs.append("constraints.deadline — момент времени числом или пусто")
-        b["constraints"] = {"forbidden_actions": list(fa), "deadline": dl}
+        # 🔴 Нормализуем ТОЛЬКО пригодное. Раньше list(fa) выполнялся даже после
+        # ошибки, и на не-списке падал с внутренней ошибкой вместо отказа.
+        if ok_fa:
+            b["constraints"] = {"forbidden_actions": list(fa),
+                                "deadline": dl if isinstance(dl, int) else None}
 
     if not isinstance(b.get("handoff_to"), str) or not b["handoff_to"].strip():
         errs.append("handoff_to обязателен: кому передаётся результат")

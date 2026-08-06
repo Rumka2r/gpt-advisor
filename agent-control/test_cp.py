@@ -33,8 +33,10 @@ def contract_for(agent, resources, handoff_to="most"):
     """Контракт под конкретные ресурсы: теперь аренда без него не выдаётся."""
     return {"schema_version": 1, "objective": "проверка", "assignee": agent,
             "resources": list(resources),
-            "outputs": [{"slot": "результат", "kind": "report", "required": True,
-                         "checks": []}],
+            # слот и проверки — машинные имена: только латиница, как в схеме;
+            # у обязательного результата должна быть хотя бы одна проверка
+            "outputs": [{"slot": "result", "kind": "report", "required": True,
+                         "checks": ["digest_verified"]}],
             "constraints": {"forbidden_actions": [], "deadline": None},
             "handoff_to": handoff_to}
 
@@ -328,6 +330,89 @@ for st in ("running", "handoff_pending", "done"):
     r = call("/task", task_id=tv, title="версии", agent_id="exec1", state=st)
     check(f"🔴 состояние {st} запросом не выставить", not r.get("ok"), r)
     check("причина названа", "выставляется системой" in str(r.get("причина", "")), r)
+
+print("")
+print("21. Блокировка и отмена отзывают действующую аренду")
+for конец in ("blocked", "cancelled"):
+    rr = "branch:" + uuid.uuid4().hex[:8]
+    tt = f"T-{конец}-" + RUN
+    call("/task", task_id=tt, title="проба", agent_id="exec1", state="assigned",
+         contract=contract_for("exec1", [rr]))
+    g = call("/acquire", agent_id="exec1", instance_id=a1, task_id=tt, resources=[rr])
+    check(f"[{конец}] аренда взята", g.get("ok"), g)
+    c = call("/check", resource=rr, lease_token=g["lease_token"],
+             fencing_token=g["fencing"][rr])
+    check(f"[{конец}] право есть", c.get("allow"), c)
+    r = call("/task", task_id=tt, title="проба", agent_id="exec1", state=конец)
+    check(f"[{конец}] переход выполнен", r.get("ok"), r)
+    check(f"🔴 [{конец}] аренда отозвана", r.get("отозванные_аренды"), r)
+    c = call("/check", resource=rr, lease_token=g["lease_token"],
+             fencing_token=g["fencing"][rr])
+    check(f"🔴 [{конец}] право отобрано", not c.get("allow"), c)
+    h = call("/heartbeat", lease_token=g["lease_token"], agent_id="exec1")
+    check(f"[{конец}] продление отклонено", not h.get("ok"), h)
+    g2 = call("/acquire", agent_id="exec1", instance_id=a1, task_id=tt, resources=[rr])
+    if конец == "blocked":
+        check("[blocked] в блокировке аренда не выдаётся", not g2.get("ok"), g2)
+        r = call("/task", task_id=tt, title="проба", agent_id="exec1", state="assigned")
+        check("🔴 из блокировки можно вернуться в работу", r.get("ok"), r)
+        g3 = call("/acquire", agent_id="exec1", instance_id=a1, task_id=tt,
+                  resources=[rr])
+        check("после возврата аренда снова выдаётся", g3.get("ok"), g3)
+        if g3.get("ok"):
+            check("поколение выросло после отзыва",
+                  g3["fencing"][rr] > g["fencing"][rr],
+                  (g["fencing"][rr], g3["fencing"][rr]))
+            call("/release", lease_token=g3["lease_token"])
+    else:
+        check("[cancelled] отменённая задача аренду не получает", not g2.get("ok"), g2)
+
+print("")
+print("22. Опечатка в контракте не проходит молча")
+bad = dict(contract_for("exec1", ["branch:x"]))
+bad["outputs"] = [{"slot": "impl", "kind": "report", "required": True,
+                   "cheks": ["tests"]}]
+r = call("/task", task_id="T-typo-" + RUN, title="опечатка", agent_id="exec1",
+         contract=bad)
+check("🔴 опечатка cheks отклонена", not r.get("ok"), r)
+check("названа как неизвестное поле", "неизвестные поля" in str(r.get("ошибки", "")), r)
+
+bad2 = dict(contract_for("exec1", ["branch:x"]))
+bad2["выдуманное"] = 1
+r = call("/task", task_id="T-typo2-" + RUN, title="опечатка", agent_id="exec1",
+         contract=bad2)
+check("лишнее поле контракта отклонено", not r.get("ok"), r)
+
+print("")
+print("23. Обязательный результат без проверок не принимается")
+bad3 = dict(contract_for("exec1", ["branch:x"]))
+bad3["outputs"] = [{"slot": "impl", "kind": "report", "required": True, "checks": []}]
+r = call("/task", task_id="T-nocheck-" + RUN, title="без проверок", agent_id="exec1",
+         contract=bad3)
+check("🔴 обязательный результат без проверок отклонён", not r.get("ok"), r)
+
+print("")
+print("24. Имена слотов и проверок нормализуются")
+ok4 = dict(contract_for("exec1", ["branch:" + uuid.uuid4().hex[:8]]))
+ok4["outputs"] = [{"slot": "  Result  ", "kind": "report", "required": True,
+                   "checks": ["  Tests ", "digest_verified"]}]
+t24 = "T-norm-" + RUN
+r = call("/task", task_id=t24, title="нормализация", agent_id="exec1", contract=ok4)
+check("контракт принят", r.get("ok"), r)
+c24 = call("/contract", task_id=t24)
+if c24.get("ok"):
+    out = c24["контракт"]["outputs"][0]
+    check("🔴 слот приведён к машинному виду", out["slot"] == "result", out)
+    check("проверки приведены", out["checks"] == ["tests", "digest_verified"], out)
+
+print("")
+print("25. Негодные ограничения не роняют сервер")
+bad5 = dict(contract_for("exec1", ["branch:x"]))
+bad5["constraints"] = {"forbidden_actions": "нельзя всё", "deadline": None}
+r = call("/task", task_id="T-con-" + RUN, title="ограничения", agent_id="exec1",
+         contract=bad5)
+check("🔴 не-список отклонён понятной ошибкой", not r.get("ok"), r)
+check("это отказ, а не сбой", "сбой" not in str(r.get("причина", "")), r)
 
 print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")
