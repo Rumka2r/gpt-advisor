@@ -35,7 +35,10 @@ TRANSITIONS = {
     "created": {"assigned", "cancelled"},
     "assigned": {"running", "blocked", "cancelled"},
     "running": {"handoff_pending", "blocked", "cancelled"},
-    "handoff_pending": {"done", "running", "blocked"},
+    # 🔴 Из ожидания решения — только приём или отказ. Раньше отсюда можно было
+    # уйти в blocked и обратно в assigned, то есть отправитель сам отменял бы
+    # передачу, минуя получателя.
+    "handoff_pending": {"done", "assigned"},
     # 🔴 Из блокировки возвращаемся в assigned, а не сразу в работу: running
     # выставляет только успешный захват аренды. Раньше blocked был тупиком —
     # выйти из него можно было лишь отменой задачи.

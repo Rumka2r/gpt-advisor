@@ -38,6 +38,7 @@ import os
 import secrets
 import socket
 import socketserver
+import handoffs
 import products
 import sqlite3
 import sys
@@ -188,7 +189,7 @@ CREATE TABLE IF NOT EXISTS events(
 
 CREATE INDEX IF NOT EXISTS ev_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ev_task ON events(task_id);
-""" + contracts.SCHEMA + products.SCHEMA
+""" + contracts.SCHEMA + products.SCHEMA + handoffs.SCHEMA
 
 
 def init():
@@ -525,6 +526,15 @@ def task_create(con, d):
         cur_state = row[0] if row else "created"
         owner = row[1] if row else None
 
+        # 🔴 Задачу, ожидающую решения по передаче, общий метод не трогает ВООБЩЕ,
+        # даже от имени Моста: иначе отправитель уводил бы её в blocked и обратно,
+        # обходя получателя. Для аварийной отмены нужен отдельный метод.
+        if cur_state == "handoff_pending":
+            con.execute("ROLLBACK")
+            return {"ok": False,
+                    "причина": "задача ожидает решения по передаче; доступны "
+                               "только приём и отказ"}
+
         if not d.get("_admin"):
             if owner and owner != d.get("agent_id"):
                 con.execute("ROLLBACK")
@@ -750,7 +760,25 @@ def product_show(con, d):
     return products.show(con, d)
 
 
+def handoff_offer(con, d):
+    return handoffs.offer(con, d, contracts, products, revoke_task_leases)
+
+
+def handoff_accept(con, d):
+    return handoffs.decide(con, d, contracts, accept=True)
+
+
+def handoff_reject(con, d):
+    return handoffs.decide(con, d, contracts, accept=False)
+
+
+def handoff_show(con, d):
+    return handoffs.show(con, d)
+
+
 ROUTES = {"/register": register, "/task": task_create, "/acquire": acquire,
+          "/handoff/offer": handoff_offer, "/handoff/accept": handoff_accept,
+          "/handoff/reject": handoff_reject, "/handoff": handoff_show,
           "/contract": contract_show,
           "/product/register": product_register, "/product/check": product_check,
           "/product": product_show,
@@ -802,7 +830,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         "причина": f"по {via} это {who}, "
                                                    f"а в запросе {d['agent_id']}"})
             d["agent_id"] = who
-        elif not d.get("agent_id"):
+        # 🔴 Фактический субъект хранится ОТДЕЛЬНО: администратор может действовать
+        # от чужого имени, но в журнале это должно быть видно, а не превращаться
+        # в запись «исполнитель сделал сам».
+        d["_actor"] = who
+        if not d.get("agent_id"):
             # 🔴 Мост тоже должен подписываться: иначе удержание, поставленное
             # администратором, не помечается как его и снять сможет любой.
             d["agent_id"] = who

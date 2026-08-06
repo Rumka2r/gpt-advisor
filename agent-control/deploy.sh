@@ -25,8 +25,8 @@ case "$(realpath -m "$DST")" in
   "$RELEASES"/*) ;;
   *) echo "путь релиза вышел за пределы $RELEASES"; exit 1 ;;
 esac
-MODULES="cp.py contracts.py products.py product_policy.py verifier.py gc.py ctl.py safe_write.py health_check.py"
-TESTS="test_cp.py test_gc.py test_products.py"
+MODULES="cp.py contracts.py products.py product_policy.py handoffs.py verifier.py gc.py ctl.py safe_write.py health_check.py"
+TESTS="test_cp.py test_gc.py test_products.py test_handoffs.py"
 
 echo "=== развёртывание $TAG ==="
 mkdir -p "$RELEASES"
