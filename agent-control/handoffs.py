@@ -72,6 +72,15 @@ def _req_sha(d):
         ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _log(con, agent, task_id, kind, payload):
+    """Событие в общий журнал: без него ни время ожидания приёмки, ни число
+    конфликтов из базы не восстановить — пришлось бы читать журналы вручную."""
+    con.execute("INSERT INTO events(ts,agent_id,task_id,kind,payload) "
+                "VALUES(?,?,?,?,?)",
+                (now(), agent, task_id, kind,
+                 __import__("json").dumps(payload, ensure_ascii=False)))
+
+
 def offer(con, d, contracts_mod, products_mod, revoke_leases):
     """Предложить результат к приёмке. Одна транзакция целиком."""
     task_id = d.get("task_id")
@@ -230,6 +239,10 @@ def offer(con, d, contracts_mod, products_mod, revoke_leases):
         revoked = revoke_leases(con, task_id, "результат передан на приёмку")
         con.execute("UPDATE tasks SET state='handoff_pending', updated=? "
                     "WHERE task_id=?", (now(), task_id))
+        _log(con, agent, task_id, "handoff_offered",
+             {"handoff_id": hid, "кому": to_agent, "предложил": actor,
+              "продукты": {s: p for s, p, _ in attach},
+              "отозвано_аренд": len(revoked)})
         con.execute("COMMIT")
         return {"ok": True, "handoff_id": hid, "статус": "offered",
                 "кому": to_agent, "отозвано_аренд": len(revoked),
@@ -256,13 +269,30 @@ def decide(con, d, contracts_mod, accept):
             con.execute("ROLLBACK")
             return {"ok": False, "причина": f"передачи {hid} нет"}
         task_id, ver, sha, to_agent, status = row
-        if status != "offered":
-            con.execute("ROLLBACK")
-            return {"ok": False, "причина": f"решение уже принято: {status}"}
+        # 🔴 Полномочия проверяем ДО ответа о повторе: иначе чужой агент по
+        # чужому идентификатору узнавал бы исход решения.
         if actor != to_agent and not d.get("_admin"):
             con.execute("ROLLBACK")
             return {"ok": False,
                     "причина": f"решение принимает {to_agent}, а не {actor}"}
+
+        if status != "offered":
+            # 🔴 Повтор того же решения — успех, а не ошибка. Координатор мог
+            # зафиксировать решение и потерять ответ; повторный запрос обязан
+            # вернуть тот же исход, иначе исполнитель решит, что приёмка сорвалась.
+            prev_reason = (con.execute("SELECT rejection_reason FROM handoffs "
+                                       "WHERE handoff_id=?", (hid,)).fetchone()
+                           or [None])[0]
+            same = (accept and status == "accepted") or (
+                not accept and status == "rejected" and prev_reason == reason)
+            con.execute("ROLLBACK")
+            if same:
+                return {"ok": True, "статус": status, "повтор": True,
+                        "состояние_задачи": "done" if status == "accepted"
+                        else "assigned"}
+            return {"ok": False,
+                    "причина": f"решение уже принято и было другим: {status}"
+                               + (f" (причина: {prev_reason})" if prev_reason else "")}
 
         trow = con.execute("SELECT state FROM tasks WHERE task_id=?",
                            (task_id,)).fetchone()
@@ -310,6 +340,8 @@ def decide(con, d, contracts_mod, accept):
                         "decided_at=? WHERE handoff_id=?", (actor, now(), hid))
             con.execute("UPDATE tasks SET state='done', updated=? WHERE task_id=?",
                         (now(), task_id))
+            _log(con, actor, task_id, "handoff_accepted",
+                 {"handoff_id": hid, "решил": actor, "продукты": attached})
             con.execute("COMMIT")
             return {"ok": True, "статус": "accepted", "состояние_задачи": "done",
                     "решил": actor}
@@ -321,6 +353,8 @@ def decide(con, d, contracts_mod, accept):
         # предложении, и вернуться к работе можно только новым захватом.
         con.execute("UPDATE tasks SET state='assigned', updated=? WHERE task_id=?",
                     (now(), task_id))
+        _log(con, actor, task_id, "handoff_rejected",
+             {"handoff_id": hid, "решил": actor, "причина": reason})
         con.execute("COMMIT")
         return {"ok": True, "статус": "rejected", "состояние_задачи": "assigned",
                 "решил": actor, "причина_отказа": reason}

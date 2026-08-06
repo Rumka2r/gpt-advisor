@@ -212,6 +212,27 @@ def api_key():
         return f.read().strip()
 
 
+def known_agents():
+    """Каталог личностей: кому вообще можно передать результат. Онлайн получатель
+    быть не обязан, но существовать — обязан."""
+    out = set()
+    try:
+        for name in os.listdir(KEYDIR):
+            if name.endswith(".key"):
+                out.add(name[:-4])
+    except OSError:
+        pass
+    try:
+        with open(MAPFILE, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split("#", 1)[0].split()
+                if len(parts) >= 2:
+                    out.add(parts[1])
+    except OSError:
+        pass
+    return out or None
+
+
 def identify(key):
     """🔴 Кто пришёл — решает СЕРВЕР по ключу, а не клиент своим полем agent_id.
     Иначе журнал ничего не доказывает: любой агент подписался бы чужим именем.
@@ -331,7 +352,9 @@ def acquire(con, d):
             hit = next(((hr, hres) for hr, hres in active_holds
                         if conflicts_with(r, hr)), None)
             if hit:
-                con.execute("ROLLBACK")
+                log(con, agent_id, task_id, "lease_refused_by_hold",
+                    {"requested": r, "hold": hit[0], "причина": hit[1]})
+                con.execute("COMMIT")
                 return {"ok": False,
                         "причина": f"ресурс {r} закрыт удержанием {hit[0]}: {hit[1]}"}
         held = con.execute("SELECT resource, agent_id, instance_id, expires "
@@ -342,7 +365,14 @@ def acquire(con, d):
                     busy.append({"resource": r, "конфликт_с": hr, "занят": ha,
                                  "освободится_через_с": max(0, he - t)})
         if busy:
-            con.execute("ROLLBACK")
+            # 🔴 Конфликт фиксируем СОБЫТИЕМ: иначе число и длительность ожиданий
+            # из базы не восстановить, а именно они показывают, окупается ли
+            # второй исполнитель.
+            for b in busy:
+                log(con, agent_id, task_id, "lease_conflict",
+                    {"requested": b["resource"], "conflicts_with": b.get("конфликт_с"),
+                     "held_by": b["занят"], "expires_in_s": b["освободится_через_с"]})
+            con.execute("COMMIT")
             return {"ok": False, "причина": "ресурсы заняты", "занятые": busy}
 
         token = secrets.token_urlsafe(24)
@@ -570,7 +600,8 @@ def task_create(con, d):
                 con.execute("ROLLBACK")
                 return {"ok": False, "причина": why2}
             ver, errs = contracts.put(con, task_id, body, d.get("agent_id", ""),
-                                      canon_resource=canon)
+                                      canon_resource=canon,
+                                      known_agents=known_agents())
             if errs:
                 con.execute("ROLLBACK")
                 return {"ok": False, "причина": "контракт не принят", "ошибки": errs}

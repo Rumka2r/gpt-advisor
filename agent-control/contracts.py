@@ -97,7 +97,7 @@ def canonical(body):
 
 # ── Проверка ────────────────────────────────────────────────────────────────
 
-def validate(body, canon_resource=None):
+def validate(body, canon_resource=None, known_agents=None):
     """Проверить тело контракта. Возвращает (ошибки, нормализованное_тело).
 
     Пустой список ошибок означает, что контракт пригоден. Нормализация приводит
@@ -229,8 +229,17 @@ def validate(body, canon_resource=None):
             b["constraints"] = {"forbidden_actions": list(fa),
                                 "deadline": dl if isinstance(dl, int) else None}
 
-    if not isinstance(b.get("handoff_to"), str) or not b["handoff_to"].strip():
+    ho = b.get("handoff_to")
+    if not isinstance(ho, str) or not ho.strip():
         errs.append("handoff_to обязателен: кому передаётся результат")
+    elif ho.strip() == str(b.get("assignee", "")).strip():
+        # 🔴 Передать результат самому себе — значит принять его самому.
+        # Формально механика соблюдена, а независимой приёмки нет вовсе.
+        errs.append("handoff_to не может совпадать с исполнителем: результат "
+                    "принимает кто-то другой")
+    elif known_agents is not None and ho.strip() not in known_agents:
+        errs.append(f"получатель {ho!r} не значится в каталоге личностей; "
+                    f"известные: {', '.join(sorted(known_agents))}")
 
     return errs, (None if errs else b)
 
@@ -253,9 +262,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS tc_one_active
 """
 
 
-def put(con, task_id, body, created_by, canon_resource=None):
+def put(con, task_id, body, created_by, canon_resource=None, known_agents=None):
     """Добавить версию контракта. Вызывать ВНУТРИ уже открытой транзакции."""
-    errs, norm = validate(body, canon_resource)
+    errs, norm = validate(body, canon_resource, known_agents)
     if errs:
         return None, errs
     text = canonical(norm)

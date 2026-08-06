@@ -204,8 +204,12 @@ h12 = r.get("handoff_id")
 r = call("/handoff/accept", agent_id="exec2", handoff_id=h12)
 check("приём выполнен", r.get("ok"), r)
 check("🔴 задача завершена", r.get("состояние_задачи") == "done", r)
+# 🔴 Повтор ТОГО ЖЕ решения — успех: ответ мог потеряться, и повторный запрос
+# обязан вернуть тот же исход, а не «ошибку» уже завершённой задачи.
 r = call("/handoff/accept", agent_id="exec2", handoff_id=h12)
-check("повторное решение отклонено", not r.get("ok"), r)
+check("🔴 повтор того же решения — успех", r.get("ok") and r.get("повтор"), r)
+r = call("/handoff/reject", agent_id="exec2", handoff_id=h12, reason="передумал")
+check("🔴 противоположное решение отклонено", not r.get("ok"), r)
 g = call("/acquire", agent_id="exec1", instance_id=c12["inst"],
          task_id=c12["task"], resources=[c12["res"]])
 check("🔴 после завершения аренду не выдают", not g.get("ok"), g)
@@ -229,6 +233,79 @@ check("🔴 предложил — фактический субъект", rec.g
 check("решил — фактический субъект", rec.get("decided_by") == "legacy",
       rec.get("decided_by"))
 check("история не переписана", rec.get("status") == "accepted", rec)
+
+print("")
+print("14. Принятый результат запечатан")
+st = call("/product", product_id=c12["product"])
+check("результат подтверждён", st.get("продукт", {}).get("state") == "verified",
+      st.get("продукт"))
+r = call("/product/check", agent_id="exec1", product_id=c12["product"],
+         check_name="tests", status="failed", evidence="нашли дефект позже")
+check("🔴 новая попытка отклонена", not r.get("ok"), r)
+check("причина названа", "запечатан" in str(r.get("причина", "")), r)
+st = call("/product", product_id=c12["product"])
+check("🔴 результат остался подтверждённым",
+      st.get("продукт", {}).get("state") == "verified", st.get("продукт"))
+h = call("/handoff", handoff_id=h12)
+check("передача осталась принятой",
+      h.get("передача", {}).get("status") == "accepted", h.get("передача"))
+tasks = {t["task_id"]: t["state"] for t in call("/status")["задачи"]}
+check("задача осталась завершённой", c12["task"] not in tasks or
+      tasks[c12["task"]] == "done", tasks.get(c12["task"]))
+
+print("")
+print("15. Повтор отказа с той же причиной — успех, с другой — отказ")
+c15 = ready("idemrej")
+r = offer(c15)
+h15 = r.get("handoff_id")
+r = call("/handoff/reject", agent_id="exec2", handoff_id=h15, reason="нужен прогон")
+check("отказ принят", r.get("ok"), r)
+r = call("/handoff/reject", agent_id="exec2", handoff_id=h15, reason="нужен прогон")
+check("🔴 повтор с той же причиной — успех", r.get("ok") and r.get("повтор"), r)
+r = call("/handoff/reject", agent_id="exec2", handoff_id=h15, reason="другая причина")
+check("🔴 другая причина — отказ", not r.get("ok"), r)
+
+print("")
+print("16. Самопередача запрещена контрактом")
+bad = contract("exec1", "branch:" + uuid.uuid4().hex[:8], to="exec1")
+r = call("/task", task_id=f"H-self-{RUN}", title="самому себе", agent_id="exec1",
+         contract=bad)
+check("🔴 передача самому себе отклонена", not r.get("ok"), r)
+bad2 = contract("exec1", "branch:" + uuid.uuid4().hex[:8], to="выдуманный")
+r = call("/task", task_id=f"H-unknown-{RUN}", title="неизвестному", agent_id="exec1",
+         contract=bad2)
+check("🔴 неизвестный получатель отклонён", not r.get("ok"), r)
+
+print("")
+print("17. Конфликт аренды попадает в журнал")
+res17 = "branch:" + uuid.uuid4().hex[:8]
+t17a, t17b = f"H-c1-{RUN}", f"H-c2-{RUN}"
+call("/task", task_id=t17a, title="первый", agent_id="exec1", state="assigned",
+     contract=contract("exec1", res17))
+call("/task", task_id=t17b, title="второй", agent_id="exec2", state="assigned",
+     contract=contract("exec2", res17, to="exec1"))
+g = call("/acquire", agent_id="exec1", instance_id=str(uuid.uuid4()), task_id=t17a,
+         resources=[res17])
+check("первый взял ресурс", g.get("ok"), g)
+r = call("/acquire", agent_id="exec2", instance_id=str(uuid.uuid4()), task_id=t17b,
+         resources=[res17])
+check("второму отказано", not r.get("ok"), r)
+ev = call("/events", limit=60)["события"]
+conflicts = [e for e in ev if e["kind"] == "lease_conflict"
+             and e["payload"].get("requested") == res17]
+check("🔴 конфликт записан событием", conflicts, [e["kind"] for e in ev[:5]])
+if conflicts:
+    p17 = conflicts[0]["payload"]
+    check("виден держатель", p17.get("held_by") == "exec1", p17)
+    check("видно, сколько ждать", isinstance(p17.get("expires_in_s"), int), p17)
+call("/release", lease_token=g["lease_token"])
+
+print("")
+print("18. События передачи пригодны для измерений")
+ev = call("/events", limit=200)["события"]
+kinds = {e["kind"] for e in ev}
+for k in ("handoff_offered", "handoff_accepted", "handoff_rejected"):
+    check(f"событие {k} пишется", k in kinds, sorted(kinds))
 
 print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")

@@ -475,6 +475,22 @@ def record_check(con, d, contracts_mod, system=False):
             con.execute("ROLLBACK")
             return {"ok": False, "причина": f"продукт в состоянии {state}"}
 
+        # 🔴 Результат, принятый в составе передачи, ЗАПЕЧАТАН. Иначе поздняя
+        # неудачная проверка сняла бы подтверждение уже после приёмки, и
+        # завершённая задача перестала бы удовлетворять собственному основанию.
+        # Найденный позже дефект — это новая задача, а не переписывание истории.
+        sealed = con.execute(
+            "SELECT h.handoff_id FROM handoff_products hp "
+            "JOIN handoffs h ON h.handoff_id = hp.handoff_id "
+            "WHERE hp.product_id=? AND h.status='accepted' LIMIT 1",
+            (pid,)).fetchone()
+        if sealed:
+            con.execute("ROLLBACK")
+            return {"ok": False,
+                    "причина": f"результат принят в составе передачи {sealed[0]} и "
+                               f"запечатан: заводи отдельную задачу, историю "
+                               f"приёмки не переписываем"}
+
         act = contracts_mod.active(con, task_id)
         if not act or act[0] != ver or act[2] != sha:
             con.execute("ROLLBACK")
