@@ -78,6 +78,13 @@ def verify_git(loc, digest):
             return "failed", {"причина": f"пути {loc['path']} в коммите нет"}
         obj = out.strip()
 
+    # 🔴 `^{object}` подтверждает существование ЛЮБОГО объекта: файл с 40-значным
+    # идентификатором прошёл бы как коммит. Требуем именно тот тип, который
+    # заявлен видом результата.
+    base = loc.get("target_commit") or loc.get("commit")
+    code, out = sh(["git", "-C", repo, "cat-file", "-e", base + "^{commit}"])
+    if code != 0:
+        return "failed", {"причина": "это не коммит", "объект": base}
     code, out = sh(["git", "-C", repo, "cat-file", "-e", obj + "^{object}"])
     if code != 0:
         return "failed", {"причина": "объекта нет в хранилище", "объект": obj}
@@ -92,6 +99,15 @@ def verify_git(loc, digest):
 
 
 def verify_object_storage(loc, digest):
+    # 🔴 Пока не читаем КОНКРЕТНУЮ версию объекта — не подтверждаем ничего.
+    # Прежняя проверка смотрела на текущий объект по ключу, то есть доказывала
+    # не то, что записано в продукте.
+    return "error", {"причина": "сверка объектного хранилища не реализована: "
+                                "нужна потоковая проверка указанной версии; "
+                                "до этого такие продукты остаются кандидатами"}
+
+
+def _verify_object_storage_disabled(loc, digest):
     store = products.OBJECT_STORES.get(loc.get("bucket"))
     if not store:
         return "error", {"причина": "хранилище не значится в каталоге"}
@@ -168,6 +184,9 @@ def main():
 
     con = sqlite3.connect(DB, timeout=30, isolation_level=None)
     con.execute("PRAGMA busy_timeout=30000")
+    # 🔴 Внешние ключи включаются НА КАЖДОМ соединении: иначе проверяющий писал
+    # бы мимо ограничений, которые соблюдает координатор.
+    con.execute("PRAGMA foreign_keys=ON")
 
     if a.product:
         row = con.execute("SELECT product_id, locator_type, locator, digest "

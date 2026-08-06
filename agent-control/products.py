@@ -30,7 +30,13 @@ import uuid as uuidlib
 import product_policy
 
 STATES = ("candidate", "verified", "rejected", "superseded")
-IMMUTABLE = ("git", "object_storage")
+
+# 🔴 Подтверждать можно только то, что мы умеем ПРОВЕРИТЬ. Сверка объектного
+# хранилища сейчас не читает конкретную версию объекта — значит доказывает не
+# то. До настоящей потоковой сверки такой продукт остаётся кандидатом навсегда:
+# лучше честно недоступная возможность, чем проверка не той версии.
+IMMUTABLE = ("git",)
+VERIFIABLE = ("git",)
 
 # 🔴 Псевдонимы хранилищ ведёт СЕРВЕР. Произвольный путь или имя корзины от
 # клиента означали бы, что «доказательство» указывает куда угодно.
@@ -75,7 +81,14 @@ CREATE TABLE IF NOT EXISTS work_products(
     created_at INTEGER NOT NULL, registered_at INTEGER NOT NULL,
     -- 🔴 Ключ повтора действует В ПРЕДЕЛАХ ЗАДАЧИ: иначе тот же ключ в другой
     -- задаче возвращал бы чужой продукт с признаком успеха.
-    UNIQUE(task_id, producer_agent, idempotency_key));
+    UNIQUE(task_id, producer_agent, idempotency_key),
+    -- 🔴 Связность держит база, а не только прикладной код: продукт без своей
+    -- версии контракта или ссылающийся на несуществующую замену — это молчаливо
+    -- испорченный учёт, который выяснится в самый неподходящий момент.
+    FOREIGN KEY(task_id, contract_version)
+        REFERENCES task_contracts(task_id, version) ON DELETE RESTRICT,
+    FOREIGN KEY(supersedes)
+        REFERENCES work_products(product_id) ON DELETE RESTRICT);
 
 -- 🔴 В одном слоте одной версии контракта живой продукт ровно один: иначе
 -- «какой результат считается итогом» становится вопросом без ответа.
@@ -89,38 +102,67 @@ CREATE TABLE IF NOT EXISTS product_checks(
     attempt INTEGER NOT NULL, status TEXT NOT NULL, checker_agent TEXT NOT NULL,
     checker_instance TEXT, evidence TEXT NOT NULL, evidence_digest TEXT,
     checked_at INTEGER NOT NULL,
-    UNIQUE(product_id, check_name, attempt));
+    UNIQUE(product_id, check_name, attempt),
+    FOREIGN KEY(product_id)
+        REFERENCES work_products(product_id) ON DELETE RESTRICT);
 """
 
 
 def migrate(con):
-    """Привести таблицу продуктов к текущей схеме.
+    """Привести таблицы к текущей схеме.
 
     🔴 `CREATE TABLE IF NOT EXISTS` существующую таблицу НЕ меняет: после
-    добавления полей и ограничений старая база молча оставалась бы прежней, и
-    регистрация падала бы «нет такого столбца». Перестраиваем с переносом
-    записей — терять уже зарегистрированные продукты нельзя.
+    добавления полей и внешних ключей старая база молча оставалась бы прежней.
+    Перестраиваем ОБЕ таблицы одной транзакцией с переносом записей, а затем
+    проверяем связность. Нашлась сирота — откат целиком: работать на испорченном
+    учёте хуже, чем не запуститься.
     """
     cols = {r[1] for r in con.execute("PRAGMA table_info(work_products)")}
-    if not cols or "request_sha256" in cols:
+    if not cols:
         return False
-    con.executescript("""
-        PRAGMA foreign_keys=OFF;
-        BEGIN IMMEDIATE;
-        ALTER TABLE work_products RENAME TO work_products_old;
-        DROP INDEX IF EXISTS wp_current_slot;
-    """)
-    con.executescript(SCHEMA)
-    old_cols = [c for c in cols if c != "request_sha256"]
-    names = ", ".join(old_cols)
-    con.execute(f"INSERT INTO work_products ({names}, request_sha256) "
-                f"SELECT {names}, '' FROM work_products_old")
-    con.executescript("""
-        DROP TABLE work_products_old;
-        COMMIT;
-        PRAGMA foreign_keys=ON;
-    """)
-    print("таблица продуктов перестроена под новую схему, записи сохранены")
+    sql = (con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND "
+                       "name='work_products'").fetchone() or [""])[0] or ""
+    need = ("request_sha256" not in cols) or ("FOREIGN KEY" not in sql.upper())
+    if not need:
+        return False
+
+    con.execute("PRAGMA foreign_keys=OFF")
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute("ALTER TABLE work_products RENAME TO work_products_old")
+        con.execute("ALTER TABLE product_checks RENAME TO product_checks_old")
+        con.execute("DROP INDEX IF EXISTS wp_current_slot")
+        # 🔴 executescript НЕЛЬЗЯ: он неявно закрывает открытую транзакцию, и
+        # последующий откат падает с «нет активной транзакции» — то есть при
+        # ошибке база осталась бы наполовину перестроенной. Выполняем по одному.
+        for stmt in [x.strip() for x in SCHEMA.split(";") if x.strip()]:
+            con.execute(stmt)
+        keep = [c for c in cols if c != "request_sha256"]
+        names = ", ".join(keep)
+        con.execute(f"INSERT INTO work_products ({names}, request_sha256) "
+                    f"SELECT {names}, '' FROM work_products_old")
+        ccols = [r[1] for r in con.execute("PRAGMA table_info(product_checks_old)")]
+        cn = ", ".join(ccols)
+        con.execute(f"INSERT INTO product_checks ({cn}) SELECT {cn} FROM product_checks_old")
+
+        orphans = list(con.execute("PRAGMA foreign_key_check"))
+        if orphans:
+            con.execute("ROLLBACK")
+            for o in orphans[:10]:
+                print(f"🔴 сирота: таблица {o[0]}, строка {o[1]}, ссылается на {o[2]}")
+            raise SystemExit(f"🔴 перенос отменён: связность нарушена "
+                             f"({len(orphans)} записей). Разбираться вручную.")
+        con.execute("DROP TABLE work_products_old")
+        con.execute("DROP TABLE product_checks_old")
+        con.execute("COMMIT")
+    except SystemExit:
+        raise
+    except Exception as e:
+        con.execute("ROLLBACK")
+        raise SystemExit(f"🔴 перенос схемы не удался: {e}")
+    finally:
+        con.execute("PRAGMA foreign_keys=ON")
+    print("таблицы продуктов перестроены с внешними ключами, записи сохранены")
     return True
 
 
@@ -185,6 +227,12 @@ def check_locator(kind, loc):
                 return (f"для object_storage обязателен {f}"
                         + (" — без версии объект изменяем" if f == "version_id" else ""),
                         None, None)
+        # 🔴 Ключ обязан лежать в отведённом пространстве: иначе продукт мог бы
+        # ссылаться на что угодно в общей корзине, включая резервные копии баз.
+        prefix = store.get("prefix", "")
+        if prefix and not loc["key"].startswith(prefix):
+            return (f"ключ должен начинаться с {prefix} — за пределами этого "
+                    f"пространства продукты не регистрируются"), None, None
         return None, t, {"type": t, "bucket": alias, "key": loc["key"],
                          "version_id": loc["version_id"]}
 
@@ -230,9 +278,12 @@ def register(con, d, contracts_mod, canon_resource):
 
     # Отпечаток запроса: по нему отличаем настоящий повтор от чужого содержимого
     # под тем же ключом.
+    # 🔴 Версия контракта входит в отпечаток запроса: тот же ключ после смены
+    # условий — это уже другой запрос, а не повтор прежнего.
     req_sha = hashlib.sha256(json.dumps(
-        {k: d.get(k) for k in ("task_id", "output_slot", "kind", "locator",
-                               "digest", "digest_alg", "size", "supersedes")},
+        {k: d.get(k) for k in ("task_id", "contract_version", "contract_sha256",
+                               "output_slot", "kind", "locator", "digest",
+                               "digest_alg", "size", "supersedes", "metadata")},
         ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
     con.execute("BEGIN IMMEDIATE")
