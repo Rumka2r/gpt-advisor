@@ -31,6 +31,7 @@ Control Plane агентов — шаг 3 плана архитектора (05.
 fencing_token отстал.
 """
 
+import contracts
 import http.server
 import json
 import os
@@ -183,7 +184,7 @@ CREATE TABLE IF NOT EXISTS events(
 
 CREATE INDEX IF NOT EXISTS ev_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ev_task ON events(task_id);
-"""
+""" + contracts.SCHEMA
 
 
 def init():
@@ -296,6 +297,18 @@ def acquire(con, d):
     task_id = d.get("task_id")
     t = now()
 
+    # 🔴 Аренда выдаётся только под задачу с действующим контрактом, только
+    # назначенному исполнителю и только на ТЕ ресурсы, что в контракте.
+    # Исключение — служебный захват сборщика: у него задачи нет по смыслу.
+    ver = digest = None
+    if agent_id != "gc":
+        if not task_id:
+            return {"ok": False, "причина": "аренда без задачи не выдаётся"}
+        err, ver, digest = contracts.check_acquire(con, task_id, agent_id, resources)
+        if err:
+            return {"ok": False, "причина": err} if isinstance(err, str) else \
+                   {"ok": False, **err}
+
     con.execute("BEGIN IMMEDIATE")
     try:
         sweep(con)
@@ -337,7 +350,8 @@ def acquire(con, d):
                         (r, task_id, agent_id, instance_id, d.get("host_id", ""),
                          d.get("boot_id", ""), token, n, t, t + TTL_S, d.get("pid", 0)))
         log(con, agent_id, task_id, "lease_acquired",
-            {"resources": resources, "fencing": fencing})
+            {"resources": resources, "fencing": fencing,
+             "версия_контракта": ver, "отпечаток_контракта": digest})
         con.execute("COMMIT")
         return {"ok": True, "lease_token": token, "fencing": fencing,
                 "expires": t + TTL_S, "heartbeat_s": HEARTBEAT_S}
@@ -450,21 +464,75 @@ def register(con, d):
 
 
 def task_create(con, d):
-    if d.get("state", "open") == "open":
+    """Завести или изменить задачу. 🔴 Контракт обязателен и проверяется схемой:
+    задача без ожидаемого результата ничего не обязывает и ничего не доказывает.
+    Изменение контракта создаёт НОВУЮ версию, прошлая остаётся в истории."""
+    task_id = d["task_id"]
+    state = d.get("state", "created")
+    ok, why = contracts.can_transition(
+        (con.execute("SELECT state FROM tasks WHERE task_id=?",
+                     (task_id,)).fetchone() or ["created"])[0], state)
+    if not ok:
+        return {"ok": False, "причина": why}
+
+    if state in ("created", "assigned"):
         ok, why = disk_gate("task")
         if not ok:
-            log(con, d.get("agent_id"), d["task_id"], "task_refused", {"причина": why})
+            log(con, d.get("agent_id"), task_id, "task_refused", {"причина": why})
             return {"ok": False, "причина": why}
+
+    body = d.get("contract")
+    if body is None and not con.execute(
+            "SELECT 1 FROM task_contracts WHERE task_id=? AND active=1",
+            (task_id,)).fetchone():
+        return {"ok": False,
+                "причина": "у задачи должен быть контракт: цель, исполнитель, "
+                           "ресурсы, ожидаемые результаты и кому передавать"}
+
     t = now()
-    con.execute("INSERT INTO tasks VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE "
-                "SET title=excluded.title, agent_id=excluded.agent_id, state=excluded.state,"
-                "updated=excluded.updated, contract=excluded.contract",
-                (d["task_id"], d.get("title", ""), d.get("agent_id", ""),
-                 d.get("state", "open"), t, t,
-                 json.dumps(d.get("contract", {}), ensure_ascii=False)))
-    log(con, d.get("agent_id"), d["task_id"], "task_" + d.get("state", "open"),
-        {"title": d.get("title", "")})
-    return {"ok": True}
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        ver = None
+        if body is not None:
+            # 🔴 Пока работа идёт, менять условия нельзя молча: новая версия
+            # заводится, но исполнитель узнаёт об этом по номеру версии в аренде.
+            ver, errs = contracts.put(con, task_id, body, d.get("agent_id", ""),
+                                      canon_resource=canon)
+            if errs:
+                con.execute("ROLLBACK")
+                return {"ok": False, "причина": "контракт не принят", "ошибки": errs}
+        act = contracts.active(con, task_id)
+        assignee = (act[1].get("assignee") if act else d.get("agent_id", ""))
+        con.execute(
+            "INSERT INTO tasks VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE "
+            "SET title=excluded.title, agent_id=excluded.agent_id, "
+            "state=excluded.state, updated=excluded.updated",
+            (task_id, d.get("title", ""), assignee, state, t, t,
+             json.dumps({"contract_version": act[0] if act else None},
+                        ensure_ascii=False)))
+        log(con, d.get("agent_id"), task_id, "task_" + state,
+            {"title": d.get("title", ""), "версия_контракта": act[0] if act else None,
+             "отпечаток": (act[2][:16] if act else None)})
+        con.execute("COMMIT")
+        return {"ok": True, "версия_контракта": act[0] if act else None,
+                "отпечаток_контракта": act[2] if act else None,
+                "состояние": state}
+    except Exception as e:
+        con.execute("ROLLBACK")
+        return {"ok": False, "причина": f"сбой: {e}"}
+
+
+def contract_show(con, d):
+    act = contracts.active(con, d["task_id"])
+    hist = [dict(version=v, sha=sha[:16], created_by=by, created_at=at, active=bool(a))
+            for v, sha, by, at, a in con.execute(
+                "SELECT version, body_sha256, created_by, created_at, active "
+                "FROM task_contracts WHERE task_id=? ORDER BY version", (d["task_id"],))]
+    if not act:
+        return {"ok": False, "причина": "у задачи нет действующего контракта",
+                "версии": hist}
+    return {"ok": True, "версия": act[0], "контракт": act[1], "отпечаток": act[2],
+            "версии": hist}
 
 
 def event(con, d):
@@ -600,6 +668,7 @@ def gc_claim(con, d):
 
 
 ROUTES = {"/register": register, "/task": task_create, "/acquire": acquire,
+          "/contract": contract_show,
           "/heartbeat": heartbeat, "/release": release, "/check": check,
           "/status": status, "/event": event, "/events": events,
           "/hold": hold_add, "/unhold": hold_del, "/holds": holds,

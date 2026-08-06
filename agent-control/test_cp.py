@@ -29,6 +29,28 @@ def check(name, cond, detail=""):
         print(f"  ✘ {name}   {detail}")
 
 
+def contract_for(agent, resources, handoff_to="most"):
+    """Контракт под конкретные ресурсы: теперь аренда без него не выдаётся."""
+    return {"schema_version": 1, "objective": "проверка", "assignee": agent,
+            "resources": list(resources),
+            "outputs": [{"slot": "результат", "kind": "report", "required": True,
+                         "checks": []}],
+            "constraints": {"forbidden_actions": [], "deadline": None},
+            "handoff_to": handoff_to}
+
+
+def acq(agent, instance, task_id, resources, state="assigned"):
+    """Завести задачу с контрактом и взять по ней аренду — так теперь выглядит
+    законный путь. Раньше аренда бралась «из воздуха»."""
+    r = call("/task", task_id=task_id, title="проверка", agent_id=agent,
+             state=state, contract=contract_for(agent, resources))
+    if not r.get("ok"):
+        return r
+    return call("/acquire", agent_id=agent, instance_id=instance, task_id=task_id,
+                resources=list(resources))
+
+
+
 def uniq(p):
     return f"{p}:{uuid.uuid4().hex[:8]}"
 
@@ -36,11 +58,11 @@ def uniq(p):
 print("1. Захват всё-или-ничего")
 r1, r2, r3 = uniq("branch"), uniq("db:schema"), uniq("port")
 a1, a2 = str(uuid.uuid4()), str(uuid.uuid4())
-g1 = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-1", resources=[r1, r2])
+g1 = acq("exec1", a1, "T-1", [r1, r2])
 check("первый берёт два ресурса", g1.get("ok"), g1)
 check("выдано поколение на каждый", set(g1.get("fencing", {})) == {r1, r2}, g1.get("fencing"))
 
-g2 = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-2", resources=[r2, r3])
+g2 = acq("exec2", a2, "T-2", [r2, r3])
 check("второму отказано при пересечении", not g2.get("ok"), g2)
 st = call("/status")
 free = all(l["resource"] != r3 for l in st["аренды"])
@@ -48,7 +70,7 @@ check("🔴 непересекающийся ресурс НЕ захвачен 
       "r3 оказался занят — частичный захват, это взаимная блокировка")
 
 print("\n2. Тот же владелец берёт повторно")
-g3 = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-1", resources=[r1])
+g3 = acq("exec1", a1, "T-1", [r1])
 check("повторный захват своим же процессом разрешён", g3.get("ok"), g3)
 
 print("\n3. Право проверяется, а не подразумевается")
@@ -70,7 +92,7 @@ check("продление подделкой отклонено", not h.get("ok"
 print("\n5. Освобождение и поколение")
 before = call("/check", resource=r1, lease_token=g3["lease_token"])
 call("/release", lease_token=g3["lease_token"])
-after = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-2", resources=[r1])
+after = acq("exec2", a2, "T-2", [r1])
 check("после освобождения ресурс достаётся другому", after.get("ok"), after)
 check("🔴 поколение выросло у нового владельца",
       after["fencing"][r1] > g3["fencing"][r1],
@@ -84,11 +106,11 @@ print("\n6. Смерть владельца: аренда переходит п�
 # TTL 90 с ждать не будем — подменяем срок в базе напрямую, имитируя молчание
 import sqlite3
 r4 = uniq("branch")   # класс с произвольным значением: каталог имён допускает
-gz = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-3", resources=[r4])
+gz = acq("exec1", a1, "T-3", [r4])
 con = sqlite3.connect("/opt/agent-control/cp.db")
 con.execute("UPDATE leases SET expires=? WHERE resource=?", (int(time.time()) - 5, r4))
 con.commit(); con.close()
-g = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-4", resources=[r4])
+g = acq("exec2", a2, "T-4", [r4])
 check("после молчания ресурс достаётся живому", g.get("ok"), g)
 check("🔴 поколение выросло при истечении",
       g["fencing"][r4] > gz["fencing"][r4],
@@ -119,21 +141,17 @@ except urllib.error.HTTPError as e:
 print("")
 print("9. Каталог имён ресурсов: выдуманные имена не принимаются")
 for bad_name in ["sandbox:deploy", "deploy:выдуманное", "простаястрока"]:
-    c = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-9",
-             resources=[bad_name])
+    c = acq("exec1", a1, "T-9", [bad_name])
     check(f"отвергнуто: {bad_name}", not c.get("ok"), c)
 
 print("")
 print("10. Вложенные пути конфликтуют, регистр не создаёт двойника")
 z = uuid.uuid4().hex[:8]
-p1 = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-10",
-          resources=[f"path:backend/{z}"])
+p1 = acq("exec1", a1, "T-10", [f"path:backend/{z}"])
 check("зона взята", p1.get("ok"), p1)
-p2 = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-11",
-          resources=[f"path:backend/{z}/models.py"])
+p2 = acq("exec2", a2, "T-11", [f"path:backend/{z}/models.py"])
 check("файл внутри занятой зоны недоступен другому", not p2.get("ok"), p2)
-p3 = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-12",
-          resources=[f"  PATH:backend/{z}  "])
+p3 = acq("exec2", a2, "T-12", [f"  PATH:backend/{z}  "])
 check("регистр и пробелы ведут к тому же ресурсу", not p3.get("ok"), p3)
 call("/release", lease_token=p1["lease_token"])
 
@@ -156,7 +174,11 @@ k2 = open("/opt/agent-control/keys/exec2.key").read().strip()
 res = "branch:" + uuid.uuid4().hex[:8]
 w = call_as(k2, "/acquire", agent_id="exec1", instance_id="i", resources=[res])
 check("ключом exec2 нельзя действовать как exec1", not w.get("ok"), w)
-w = call_as(k2, "/acquire", agent_id="exec2", instance_id="i", resources=[res])
+# законный путь: сначала задача с контрактом, затем аренда своим ключом
+call_as(k2, "/task", task_id="T-key", title="проверка ключа", agent_id="exec2",
+        state="assigned", contract=contract_for("exec2", [res]))
+w = call_as(k2, "/acquire", agent_id="exec2", instance_id="i", task_id="T-key",
+            resources=[res])
 check("своим именем можно", w.get("ok"), w)
 if w.get("ok"):
     call("/release", lease_token=w["lease_token"])
@@ -164,8 +186,7 @@ if w.get("ok"):
 print("")
 print("12. Позднее удержание останавливает уже начатую работу")
 res12 = "branch:" + uuid.uuid4().hex[:8]
-g12 = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-12",
-           resources=[res12])
+g12 = acq("exec1", a1, "T-12", [res12])
 check("аренда взята", g12.get("ok"), g12)
 c = call("/check", resource=res12, lease_token=g12["lease_token"],
          fencing_token=g12["fencing"][res12])
@@ -184,10 +205,85 @@ print("13. Удержание закрывает и вложенные пути"
 z13 = uuid.uuid4().hex[:8]
 call("/hold", resource=f"path:backend/{z13}", reason="зона под расследованием",
      expires_at=int(time.time()) + 3600)
-r13 = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-13",
-           resources=[f"path:backend/{z13}/models.py"])
+r13 = acq("exec2", a2, "T-13", [f"path:backend/{z13}/models.py"])
 check("файл внутри удержанной зоны не выдан", not r13.get("ok"), r13)
 call("/unhold", resource=f"path:backend/{z13}")
+
+print("")
+print("14. Задача без контракта не заводится")
+r = call("/task", task_id="T-14", title="без контракта", agent_id="exec1")
+check("🔴 задача без контракта отклонена", not r.get("ok"), r)
+
+print("")
+print("15. Контракт проверяется схемой")
+bad = [
+    ({"schema_version": 9}, "чужая версия схемы"),
+    ({"schema_version": 1, "objective": "", "assignee": "exec1",
+      "resources": ["branch:x"], "outputs": [{"slot": "s", "kind": "report"}],
+      "handoff_to": "most"}, "пустая цель"),
+    ({"schema_version": 1, "objective": "ц", "assignee": "exec1",
+      "resources": [], "outputs": [{"slot": "s", "kind": "report"}],
+      "handoff_to": "most"}, "пустые ресурсы"),
+    ({"schema_version": 1, "objective": "ц", "assignee": "exec1",
+      "resources": ["branch:x"], "outputs": [], "handoff_to": "most"},
+     "нет ожидаемого результата"),
+    ({"schema_version": 1, "objective": "ц", "assignee": "exec1",
+      "resources": ["branch:x"],
+      "outputs": [{"slot": "s", "kind": "выдуманный", "required": True}],
+      "handoff_to": "most"}, "неизвестный вид результата"),
+    ({"schema_version": 1, "objective": "ц", "assignee": "exec1",
+      "resources": ["выдуманное:имя"],
+      "outputs": [{"slot": "s", "kind": "report", "required": True}],
+      "handoff_to": "most"}, "ресурс вне каталога имён"),
+]
+for body, why in bad:
+    r = call("/task", task_id="T-15-" + why[:6], title="проба", agent_id="exec1",
+             contract=body)
+    check(f"отклонено: {why}", not r.get("ok"), r)
+
+print("")
+print("16. Ресурсы аренды обязаны совпадать с контрактом")
+r16 = "branch:" + uuid.uuid4().hex[:8]
+lишний = "branch:" + uuid.uuid4().hex[:8]
+call("/task", task_id="T-16", title="проба", agent_id="exec1", state="assigned",
+     contract=contract_for("exec1", [r16]))
+g = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-16",
+         resources=[r16, lишний])
+check("🔴 лишний ресурс не выдан", not g.get("ok"), g)
+g = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-16", resources=[])
+check("пустой набор не выдан", not g.get("ok"), g)
+g = call("/acquire", agent_id="exec1", instance_id=a1, task_id="T-16", resources=[r16])
+check("ровно те ресурсы — выдано", g.get("ok"), g)
+if g.get("ok"):
+    call("/release", lease_token=g["lease_token"])
+
+print("")
+print("17. Аренду берёт только назначенный исполнитель")
+g = call("/acquire", agent_id="exec2", instance_id=a2, task_id="T-16", resources=[r16])
+check("🔴 чужую задачу взять нельзя", not g.get("ok"), g)
+
+print("")
+print("18. Контракт неизменяем: правка создаёт версию")
+c1 = call("/contract", task_id="T-16")
+check("контракт читается", c1.get("ok"), c1)
+call("/task", task_id="T-16", title="проба", agent_id="exec1", state="assigned",
+     contract=dict(contract_for("exec1", [r16]), objective="другая цель"))
+c2 = call("/contract", task_id="T-16")
+check("🔴 появилась новая версия", c2.get("версия") == c1.get("версия") + 1,
+      (c1.get("версия"), c2.get("версия")))
+check("прошлая версия сохранена", len(c2.get("версии", [])) >= 2, c2.get("версии"))
+check("отпечаток изменился", c2.get("отпечаток") != c1.get("отпечаток"))
+same = call("/task", task_id="T-16", title="проба", agent_id="exec1", state="assigned",
+            contract=dict(contract_for("exec1", [r16]), objective="другая цель"))
+c3 = call("/contract", task_id="T-16")
+check("тот же контракт новой версии не плодит", c3.get("версия") == c2.get("версия"),
+      (c2.get("версия"), c3.get("версия")))
+
+print("")
+print("19. Прямой переход задачи в «готово» запрещён")
+r = call("/task", task_id="T-16", title="проба", agent_id="exec1", state="done")
+check("🔴 задачу нельзя объявить готовой напрямую", not r.get("ok"), r)
+check("причина названа", "запрещ" in str(r.get("причина", "")), r)
 
 print("")
 print(f"ИТОГ: {N[1]} из {N[0]}")
