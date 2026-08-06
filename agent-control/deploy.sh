@@ -16,7 +16,15 @@ ROOT=/opt/agent-control
 RELEASES=$ROOT/releases
 SRC=${1:?укажи каталог с новым комплектом}
 TAG=${2:-$(date -u +%Y%m%dT%H%M%SZ)}
-DST=$RELEASES/$TAG
+# 🔴 Метка идёт в rm -rf, а скрипт работает от root: слеши или .. в ней означают
+# удаление каталога за пределами releases. Отсюда — жёсткая проверка имени и
+# отдельно проверка, что итоговый путь действительно внутри releases.
+[[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "негодная метка релиза: $TAG"; exit 1; }
+DST="$RELEASES/$TAG"
+case "$(realpath -m "$DST")" in
+  "$RELEASES"/*) ;;
+  *) echo "путь релиза вышел за пределы $RELEASES"; exit 1 ;;
+esac
 MODULES="cp.py contracts.py gc.py ctl.py safe_write.py"
 TESTS="test_cp.py test_gc.py"
 
@@ -73,12 +81,30 @@ echo "--- переключение ---"
 PREV=$(readlink -f "$ROOT/current" 2>/dev/null || echo "")
 ln -sfn "$DST" "$ROOT/current.new" && mv -Tf "$ROOT/current.new" "$ROOT/current"
 for f in $MODULES $TESTS; do ln -sfn "$ROOT/current/$f" "$ROOT/$f"; done
+# 🔴 systemctl is-active доказывает лишь, что процесс не умер. Координатор обязан
+# ОТВЕЧАТЬ — проверяем настоящим запросом, как и временный экземпляр.
+alive() {
+  systemctl is-active --quiet agent-cp || return 1
+  python3 "$ROOT/health_check.py"
+}
+
 systemctl restart agent-cp
 sleep 3
-if ! systemctl is-active --quiet agent-cp; then
-  echo "🔴 служба не поднялась — ВОЗВРАТ на $PREV"
-  [ -n "$PREV" ] && ln -sfn "$PREV" "$ROOT/current" && systemctl restart agent-cp
+if ! alive; then
+  echo "🔴 координатор не отвечает — ВОЗВРАТ на $PREV"
+  if [ -n "$PREV" ]; then
+    ln -sfn "$PREV" "$ROOT/current"
+    for f in $MODULES $TESTS; do ln -sfn "$ROOT/current/$f" "$ROOT/$f"; done
+    systemctl restart agent-cp
+    sleep 3
+    if alive; then
+      echo "возврат удался, координатор отвечает"
+    else
+      echo "🔴 и прошлая версия не отвечает — разбираться руками"
+    fi
+  fi
   exit 1
 fi
+echo "координатор отвечает на запросы"
 echo "готово: current → $DST"
 ls -l "$ROOT/current"

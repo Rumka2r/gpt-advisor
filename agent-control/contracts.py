@@ -23,6 +23,8 @@ import json
 import re
 import time
 
+import product_policy
+
 SCHEMA_VERSION = 1
 
 # Состояния задачи и разрешённые переходы. 🔴 Прямого пути в «готово» нет:
@@ -170,6 +172,14 @@ def validate(body, canon_resource=None):
                 continue
             if len(set(names)) != len(names):
                 errs.append(f"выход {slot}: названия проверок повторяются")
+                continue
+            # 🔴 Неизвестную проверку отвергаем СРАЗУ: иначе получится контракт,
+            # который невозможно закрыть — такую проверку никто не сможет записать.
+            unknown = [x for x in names if not product_policy.known(x)]
+            if unknown:
+                errs.append(f"выход {slot}: неизвестные проверки {', '.join(unknown)}; "
+                            f"допустимые: "
+                            f"{', '.join(sorted(product_policy.CHECK_POLICIES))}")
                 continue
             # 🔴 Обязательный результат без единой проверки бессмыслен: реестр
             # примет что угодно и сочтёт задачу выполненной.

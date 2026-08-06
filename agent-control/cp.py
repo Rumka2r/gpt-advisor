@@ -38,6 +38,7 @@ import os
 import secrets
 import socket
 import socketserver
+import products
 import sqlite3
 import sys
 import threading
@@ -187,7 +188,7 @@ CREATE TABLE IF NOT EXISTS events(
 
 CREATE INDEX IF NOT EXISTS ev_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ev_task ON events(task_id);
-""" + contracts.SCHEMA
+""" + contracts.SCHEMA + products.SCHEMA
 
 
 def init():
@@ -734,8 +735,24 @@ def gc_claim(con, d):
         return {"ok": False, "причина": str(e)}
 
 
+def product_register(con, d):
+    return products.register(con, d, contracts, canon)
+
+
+def product_check(con, d):
+    # 🔴 Признак «системная проверка» никогда не приходит от клиента: иначе
+    # производитель сам поставил бы себе digest_verified.
+    return products.record_check(con, d, contracts, system=False)
+
+
+def product_show(con, d):
+    return products.show(con, d)
+
+
 ROUTES = {"/register": register, "/task": task_create, "/acquire": acquire,
           "/contract": contract_show,
+          "/product/register": product_register, "/product/check": product_check,
+          "/product": product_show,
           "/heartbeat": heartbeat, "/release": release, "/check": check,
           "/status": status, "/event": event, "/events": events,
           "/hold": hold_add, "/unhold": hold_del, "/holds": holds,
