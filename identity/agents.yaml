@@ -1,0 +1,14 @@
+# Статический реестр агентов — источник истины «кто существует».
+# Вердикт архитектора 06.08.2026 («Для 999», reply_999_identity_full.md):
+# agent_id — долговечный владелец памяти и нитей; instance_id (запуск) и
+# session_id живут в runtime-реестре registry.sqlite рядом с этим файлом.
+# Новый агент = новая запись здесь; launcher не запустит неизвестного.
+agents:
+  osha-main:
+    profile: osha
+  osha-999:
+    profile: osha
+  most:
+    profile: most
+  glm:
+    profile: glm
